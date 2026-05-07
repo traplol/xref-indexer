@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::index::Index;
 use crate::types::*;
@@ -239,18 +239,17 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
         let rows = stmt.query_map([], |row| {
             let file_id: Option<i64> = row.get(13)?;
             let file_path = file_id.and_then(|fid| {
-                conn.query_row(
-                    "SELECT path FROM files WHERE id = ?1",
-                    params![fid],
-                    |r| r.get::<_, String>(0),
-                )
+                conn.query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
+                    r.get::<_, String>(0)
+                })
                 .ok()
             });
             Ok(Definition {
                 id: Some(row.get(0)?),
                 name: row.get(1)?,
                 qualified_name: row.get(2)?,
-                kind: SymbolKind::from_str(&row.get::<_, String>(3)?).unwrap_or(SymbolKind::Function),
+                kind: SymbolKind::from_str(&row.get::<_, String>(3)?)
+                    .unwrap_or(SymbolKind::Function),
                 location: Location {
                     file: file_path.map(std::path::PathBuf::from).unwrap_or_default(),
                     line: row.get::<_, i64>(4)? as usize,
@@ -273,23 +272,21 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
 
     let mut references: Vec<Reference> = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, kind, line, column, def_id, context, file_id FROM refs",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, kind, line, column, def_id, context, file_id FROM refs")?;
         let rows = stmt.query_map([], |row| {
             let file_id: Option<i64> = row.get(7)?;
             let file_path = file_id.and_then(|fid| {
-                conn.query_row(
-                    "SELECT path FROM files WHERE id = ?1",
-                    params![fid],
-                    |r| r.get::<_, String>(0),
-                )
+                conn.query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
+                    r.get::<_, String>(0)
+                })
                 .ok()
             });
             Ok(Reference {
                 id: Some(row.get(0)?),
                 name: row.get(1)?,
-                kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                kind: SymbolKind::from_str(&row.get::<_, String>(2)?)
+                    .unwrap_or(SymbolKind::Function),
                 location: Location {
                     file: file_path.map(std::path::PathBuf::from).unwrap_or_default(),
                     line: row.get::<_, i64>(3)? as usize,
@@ -308,17 +305,14 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
 
     let mut calls: Vec<CallEdge> = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT caller_name, callee_name, line, column, file_id FROM call_graph",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT caller_name, callee_name, line, column, file_id FROM call_graph")?;
         let rows = stmt.query_map([], |row| {
             let file_id: Option<i64> = row.get(4)?;
             let file_path = file_id.and_then(|fid| {
-                conn.query_row(
-                    "SELECT path FROM files WHERE id = ?1",
-                    params![fid],
-                    |r| r.get::<_, String>(0),
-                )
+                conn.query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
+                    r.get::<_, String>(0)
+                })
                 .ok()
             });
             Ok(CallEdge {
@@ -340,9 +334,8 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
 
     let mut inherits: Vec<InheritEdge> = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT derived_name, base_name, access, is_virtual FROM inheritance",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT derived_name, base_name, access, is_virtual FROM inheritance")?;
         let rows = stmt.query_map([], |row| {
             Ok(InheritEdge {
                 derived_name: row.get(0)?,

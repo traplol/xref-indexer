@@ -29,7 +29,9 @@ fn test_index_cpp_fixtures() {
     );
 
     // Namespace should be found somewhere (either "demo" or "demo::demo")
-    let has_namespace = def_names.iter().any(|n| *n == "demo" || n.ends_with("::demo") || n.starts_with("demo::"));
+    let has_namespace = def_names
+        .iter()
+        .any(|n| *n == "demo" || n.ends_with("::demo") || n.starts_with("demo::"));
     assert!(has_namespace, "expected demo namespace; got: {def_names:?}");
 
     // Class — check for Base and Derived qualified by demo namespace
@@ -39,7 +41,9 @@ fn test_index_cpp_fixtures() {
     assert!(has_derived, "expected Derived class; got: {def_names:?}");
 
     // Enums & variants
-    let has_color = def_names.iter().any(|n| n.ends_with("::Color") || *n == "Color");
+    let has_color = def_names
+        .iter()
+        .any(|n| n.ends_with("::Color") || *n == "Color");
     assert!(has_color, "expected Color enum; got: {def_names:?}");
     for variant in &["RED", "GREEN", "BLUE"] {
         let found = all_defs
@@ -49,18 +53,19 @@ fn test_index_cpp_fixtures() {
     }
 
     // Global variable
-    let has_global = def_names.iter().any(|n| n.ends_with("::global_counter") || *n == "global_counter");
+    let has_global = def_names
+        .iter()
+        .any(|n| n.ends_with("::global_counter") || *n == "global_counter");
     assert!(has_global, "expected global_counter; got: {def_names:?}");
 
     // Function
-    let has_compute = def_names.iter().any(|n| n.ends_with("::compute") || *n == "compute");
+    let has_compute = def_names
+        .iter()
+        .any(|n| n.ends_with("::compute") || *n == "compute");
     assert!(has_compute, "expected compute function; got: {def_names:?}");
 
     // Class method (at least the definition in demo.cpp)
-    let run_defs: Vec<_> = all_defs
-        .iter()
-        .filter(|d| d.name == "run")
-        .collect();
+    let run_defs: Vec<_> = all_defs.iter().filter(|d| d.name == "run").collect();
     assert!(!run_defs.is_empty(), "expected run method(s)");
 
     // Constructor
@@ -102,8 +107,16 @@ fn test_index_cpp_fixtures() {
     );
 
     // Check that we found a reasonable number of definitions
-    assert!(all_defs.len() >= 15, "expected at least 15 definitions, got {}", all_defs.len());
-    assert!(refs.len() >= 10, "expected at least 10 references, got {}", refs.len());
+    assert!(
+        all_defs.len() >= 15,
+        "expected at least 15 definitions, got {}",
+        all_defs.len()
+    );
+    assert!(
+        refs.len() >= 10,
+        "expected at least 10 references, got {}",
+        refs.len()
+    );
 }
 
 #[test]
@@ -116,7 +129,10 @@ fn test_search_symbols() {
     let index = indexer.index().expect("indexing should succeed");
 
     let results = index.search_symbols("compute");
-    assert!(!results.is_empty(), "search for 'compute' should return results");
+    assert!(
+        !results.is_empty(),
+        "search for 'compute' should return results"
+    );
     assert!(results.iter().any(|d| d.name == "compute"));
 
     let results = index.search_symbols("nonexistent_xyzzy");
@@ -133,12 +149,9 @@ fn test_save_and_load_db() {
     let index = indexer.index().expect("indexing should succeed");
 
     let db_path = fixtures_dir().join("test_output.db");
-    let _conn = index
-        .save_to_db(&db_path)
-        .expect("save should succeed");
+    let _conn = index.save_to_db(&db_path).expect("save should succeed");
 
-    let (loaded, _conn) = xref_indexer::Index::open_from_db(&db_path)
-        .expect("load should succeed");
+    let (loaded, _conn) = xref_indexer::Index::open_from_db(&db_path).expect("load should succeed");
 
     assert_eq!(
         loaded.definition_count(),

@@ -44,7 +44,13 @@ fn main() {
         if !defs.is_empty() {
             println!("\n'{name}': {} definition(s)", defs.len());
             for d in &defs {
-                println!("  {} {} at {}:{}", d.kind.as_str(), d.qualified_name, d.location.file.display(), d.location.line);
+                println!(
+                    "  {} {} at {}:{}",
+                    d.kind.as_str(),
+                    d.qualified_name,
+                    d.location.file.display(),
+                    d.location.line
+                );
             }
         }
     }

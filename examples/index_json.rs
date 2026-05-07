@@ -19,12 +19,24 @@ fn main() {
     println!("Inherits:     {}", index.inherits().len());
 
     // Search for well-known symbols.
-    let searches = ["basic_json", "json", "to_json", "from_json", "NLOHMANN_DEFINE_TYPE_INTRUSIVE"];
+    let searches = [
+        "basic_json",
+        "json",
+        "to_json",
+        "from_json",
+        "NLOHMANN_DEFINE_TYPE_INTRUSIVE",
+    ];
     for name in &searches {
         let defs = index.find_definition(name);
         println!("\n'{name}': {} definition(s)", defs.len());
         for d in defs.iter().take(3) {
-            println!("  {} {} at {}:{}", d.kind.as_str(), d.qualified_name, d.location.file.display(), d.location.line);
+            println!(
+                "  {} {} at {}:{}",
+                d.kind.as_str(),
+                d.qualified_name,
+                d.location.file.display(),
+                d.location.line
+            );
         }
         if defs.len() > 3 {
             println!("  ... and {} more", defs.len() - 3);

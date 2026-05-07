@@ -43,7 +43,9 @@ impl Language {
     fn extensions(&self) -> &[&str] {
         match self {
             Language::C => &["c", "h"],
-            Language::Cpp => &["cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "h", "c"],
+            Language::Cpp => &[
+                "cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "h", "c",
+            ],
         }
     }
 }
@@ -124,9 +126,16 @@ impl Indexer {
                     }
                     if e.file_type().is_dir() {
                         let skip_dirs = [
-                            "build", "cmake-build-debug", "cmake-build-release", "bazel-bin",
-                            "bazel-out", "bazel-testlogs", "node_modules", "third_party",
-                            "third-party", ".git",
+                            "build",
+                            "cmake-build-debug",
+                            "cmake-build-release",
+                            "bazel-bin",
+                            "bazel-out",
+                            "bazel-testlogs",
+                            "node_modules",
+                            "third_party",
+                            "third-party",
+                            ".git",
                         ];
                         return !skip_dirs.contains(&name);
                     }
@@ -167,14 +176,15 @@ impl Indexer {
 
 impl Index {
     /// Save this index to a SQLite database file.
-    pub fn save_to_db(&self, path: impl AsRef<Path>) -> Result<rusqlite::Connection, rusqlite::Error> {
+    pub fn save_to_db(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<rusqlite::Connection, rusqlite::Error> {
         db::save_to_db(self, path.as_ref())
     }
 
     /// Load an index from a SQLite database file.
-    pub fn open_from_db(
-        path: impl AsRef<Path>,
-    ) -> rusqlite::Result<(Self, rusqlite::Connection)> {
+    pub fn open_from_db(path: impl AsRef<Path>) -> rusqlite::Result<(Self, rusqlite::Connection)> {
         db::open_from_db(path.as_ref())
     }
 }

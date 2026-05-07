@@ -95,7 +95,10 @@ impl<'a> ParseState<'a> {
     }
 
     fn current_visibility(&self) -> Visibility {
-        self.visibility_stack.last().copied().unwrap_or(Visibility::Public)
+        self.visibility_stack
+            .last()
+            .copied()
+            .unwrap_or(Visibility::Public)
     }
 
     fn qualified_name(&self, name: &str) -> String {
@@ -207,16 +210,13 @@ impl<'a> ParseState<'a> {
                 if self.collect_definitions {
                     if let Some(name) = extract_function_name(node, self.source) {
                         let is_method = self.scope_stack.iter().any(|(_, k)| {
-                            matches!(
-                                k,
-                                SymbolKind::Class
-                                    | SymbolKind::Struct
-                                    | SymbolKind::Enum
-                            )
+                            matches!(k, SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum)
                         });
                         let kind = if name.starts_with('~') {
                             SymbolKind::Destructor
-                        } else if is_method && self.scope_stack.last().map(|s| s.0.as_str()) == Some(name.as_str()) {
+                        } else if is_method
+                            && self.scope_stack.last().map(|s| s.0.as_str()) == Some(name.as_str())
+                        {
                             SymbolKind::Constructor
                         } else if is_method {
                             SymbolKind::Method
@@ -226,7 +226,8 @@ impl<'a> ParseState<'a> {
                         let sig = Some(self.node_text(node).to_string());
                         let vis = self.current_visibility();
                         let qn = self.qualified_name(&name);
-                        let loc = self.point_to_location(node.start_position(), node.end_position());
+                        let loc =
+                            self.point_to_location(node.start_position(), node.end_position());
                         self.def_locations.insert((loc.line, loc.column));
 
                         // Adjust loc to the name position.
@@ -281,7 +282,8 @@ impl<'a> ParseState<'a> {
             "preproc_function_def" => {
                 if self.collect_definitions {
                     if let Some(name) = node.child_by_field_name("name") {
-                        let loc = self.point_to_location(name.start_position(), name.end_position());
+                        let loc =
+                            self.point_to_location(name.start_position(), name.end_position());
                         self.def_locations.insert((loc.line, loc.column));
                         let qn = self.qualified_name(&self.node_text(name));
                         self.definitions.push(Definition {
@@ -420,11 +422,13 @@ impl<'a> ParseState<'a> {
         // Check if this is a function forward-declaration.
         if let Some(func_dec) = child_of_kind(node, "function_declarator") {
             if let Some(name) = extract_name_from_declarator(func_dec, self.source) {
-                let loc = self.point_to_location(func_dec.start_position(), func_dec.end_position());
+                let loc =
+                    self.point_to_location(func_dec.start_position(), func_dec.end_position());
                 self.def_locations.insert((loc.line, loc.column));
-                let is_method = self.scope_stack.iter().any(|(_, k)| {
-                    matches!(k, SymbolKind::Class | SymbolKind::Struct)
-                });
+                let is_method = self
+                    .scope_stack
+                    .iter()
+                    .any(|(_, k)| matches!(k, SymbolKind::Class | SymbolKind::Struct));
                 let kind = if is_method {
                     SymbolKind::Method
                 } else {
@@ -432,10 +436,8 @@ impl<'a> ParseState<'a> {
                 };
                 let qn = self.qualified_name(&name);
                 let name_node = find_name_node(node, self.source).unwrap_or(node);
-                let name_loc = self.point_to_location(
-                    name_node.start_position(),
-                    name_node.end_position(),
-                );
+                let name_loc =
+                    self.point_to_location(name_node.start_position(), name_node.end_position());
                 self.definitions.push(Definition {
                     id: None,
                     name,
@@ -472,13 +474,15 @@ impl<'a> ParseState<'a> {
                             .map(|(_, k)| {
                                 matches!(
                                     k,
-                                    SymbolKind::Class
-                                        | SymbolKind::Struct
-                                        | SymbolKind::Enum
+                                    SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum
                                 )
                             })
                             .unwrap_or(false);
-                        let kind = if is_field { SymbolKind::Field } else { SymbolKind::Variable };
+                        let kind = if is_field {
+                            SymbolKind::Field
+                        } else {
+                            SymbolKind::Variable
+                        };
                         self.definitions.push(Definition {
                             id: None,
                             name,
@@ -625,8 +629,7 @@ impl<'a> ParseState<'a> {
             }
 
             let loc = self.point_to_location(callee.start_position(), callee.end_position());
-            let callee_loc =
-                self.point_to_location(callee.start_position(), callee.end_position());
+            let callee_loc = self.point_to_location(callee.start_position(), callee.end_position());
             self.calls.push(CallEdge {
                 caller_name: caller_name.clone(),
                 callee_name: callee_name.clone(),
@@ -634,7 +637,10 @@ impl<'a> ParseState<'a> {
             });
 
             // Also register the callee name as a reference.
-            if !self.def_locations.contains(&(callee_loc.line, callee_loc.column)) {
+            if !self
+                .def_locations
+                .contains(&(callee_loc.line, callee_loc.column))
+            {
                 let ctx = self.line_context(callee_loc.line);
                 self.references.push(Reference {
                     id: None,
@@ -725,7 +731,9 @@ fn extract_name_from_declarator(declarator: Node, source: &str) -> Option<String
                 }
                 return None;
             }
-            "function_declarator" | "array_declarator" | "pointer_declarator"
+            "function_declarator"
+            | "array_declarator"
+            | "pointer_declarator"
             | "reference_declarator" => {
                 if let Some(inner) = current.child_by_field_name("declarator") {
                     current = inner;

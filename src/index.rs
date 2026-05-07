@@ -51,10 +51,7 @@ impl Index {
         }
 
         for (i, r) in self.references.iter().enumerate() {
-            self.refs_by_name
-                .entry(r.name.clone())
-                .or_default()
-                .push(i);
+            self.refs_by_name.entry(r.name.clone()).or_default().push(i);
         }
 
         for (i, call) in self.calls.iter().enumerate() {
