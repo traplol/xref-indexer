@@ -1,4 +1,6 @@
 /target
 **/*.rs.bk
 *.db
+*.db-shm
+*.db-wal
 /test-data
