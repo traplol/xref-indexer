@@ -1,0 +1,15 @@
+[package]
+name = "xref-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "C/C++ cross-reference indexer for codebase exploration — built for LLM consumption"
+
+[dependencies]
+tree-sitter = "0.26"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+rusqlite = { version = "0.39", features = ["bundled"] }
+walkdir = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustc-hash = "2.1"
