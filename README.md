@@ -45,6 +45,9 @@ cargo run --release -- index --root tests/fixtures --language cpp
 # Benchmark a full first run with phase timings.
 cargo run --release -- bench --root test-data --db /tmp/xrefs-bench.sqlite3 --pretty
 
+# Update only new/changed/deleted files in an existing DB.
+cargo run --release -- reindex --root test-data --db /tmp/xrefs-bench.sqlite3 --pretty
+
 # Find exact definition candidates, with context.
 cargo run --release -- find demo::Derived::run --pretty
 
@@ -60,6 +63,8 @@ cargo run --release -- context --file tests/fixtures/demo.cpp --line 15 --contex
 cargo run --release -- sql --sql "SELECT name, qualified_name, kind FROM definitions LIMIT 10" --pretty
 ```
 
+DB-backed query commands run an incremental reindex check before reading SQLite. They use the roots and index options saved by `index`, `reindex`, or saved `bench --db` runs, so a normal `find`/`refs`/`callers` request sees edits made since the last command. Pass `--no-reindex` to skip the filesystem check, or pass `--root PATH` on a query to override the saved roots for that invocation.
+
 The CLI reports confidence/provenance-style fields such as `exact_qualified`, `exact_simple`, `substring`, `resolved_unique_name`, and `structural_call`. The index is Tree-sitter based, so treat results as fast structural candidates rather than compiler-perfect C++ semantic facts.
 
 The default reference mode is `--references calls`, which stores definitions, call graph edges, and call-site refs. Use `--references all` for exhaustive identifier refs, or `--references none` when the call graph table is enough. Per-reference source-line context is disabled by default; use `context`/snippets for lazy source text, or pass `--reference-context` for the heavier legacy behavior.
@@ -72,10 +77,12 @@ On the local 10,010-file downloaded C++ corpus in `test-data`, release-mode firs
 
 ```text
 files=10010 definitions=629972 calls=847774 refs=827067
-index=9747ms save=6984ms total=16732ms
+index=9792ms save=8394ms total=18187ms
 ```
 
-The high-level CLI lookup commands query SQLite directly instead of hydrating the full index into memory per invocation. On the same 302 MB large index DB, representative release-mode query timings were `find` 3 ms, `refs` 3 ms, `callers` 3 ms, `callees` 5 ms, `search` 7 ms, `hierarchy` 24 ms, `stats` 34 ms, and `expand --depth 2 --limit 20` 124 ms.
+The high-level CLI lookup commands query SQLite directly instead of hydrating the full index into memory per invocation. With `--no-reindex` on the same 302 MB large index DB, representative release-mode raw query timings were `find` 3 ms, `refs` 3 ms, `callers` 3 ms, `callees` 5 ms, `search` 7 ms, `hierarchy` 24 ms, `stats` 34 ms, and `expand --depth 2 --limit 20` 124 ms.
+
+Incremental `reindex` stores both content checksums and symbol-output fingerprints per file. DB-backed query commands run the same incremental check automatically before answering. A clean auto-reindexed `find` against the large DB checked 10,010 indexed files, parsed 0, and answered with `reindex.metrics.total_ms=437`. After appending comments to 250 random C/C++ files with `scripts/modify-random.py`, the same query parsed 217 changed indexed files and updated the DB before lookup in `847ms` total (`discover=122ms checksum=306ms parse=330ms db=4ms`) because the parsed symbols were unchanged.
 
 For the leanest first run, `--references none` keeps `call_graph` but skips the duplicate call-site `refs` rows; on the same corpus that mode measured `total=13442ms`.
 
@@ -90,6 +97,7 @@ CREATE TABLE files (
     path TEXT UNIQUE NOT NULL,
     language TEXT NOT NULL,
     checksum TEXT,
+    symbols_checksum TEXT,
     indexed_at INTEGER DEFAULT (unixepoch())
 );
 
@@ -140,6 +148,7 @@ CREATE TABLE inheritance (
     id INTEGER PRIMARY KEY,
     derived_id INTEGER REFERENCES definitions(id),
     base_id INTEGER REFERENCES definitions(id),
+    file_id INTEGER REFERENCES files(id),
     access TEXT DEFAULT 'public',
     is_virtual INTEGER DEFAULT 0,
     derived_name TEXT,

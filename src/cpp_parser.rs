@@ -793,6 +793,8 @@ impl<'a> ParseState<'a> {
                         self.inherits.push(InheritEdge {
                             derived_name: derived_name.clone(),
                             base_name,
+                            location: self
+                                .point_to_location(child.start_position(), child.end_position()),
                             access: current_access.unwrap_or(default_access),
                             is_virtual: current_virtual,
                         });

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -456,6 +457,75 @@ fn test_save_and_load_db() {
 }
 
 #[test]
+fn test_incremental_reindex_only_parses_changed_files() {
+    let root = unique_db_path("xref-indexer-incremental-root");
+    std::fs::create_dir_all(&root).expect("create temp root");
+    std::fs::write(root.join("a.cpp"), "int alpha() { return 1; }\n").expect("write a.cpp");
+    std::fs::write(root.join("b.cpp"), "int beta() { return alpha(); }\n").expect("write b.cpp");
+
+    let indexer = Indexer::builder()
+        .add_directory(&root)
+        .language(Language::Cpp)
+        .build();
+    let index = indexer.index().expect("initial index should succeed");
+    let db_path = unique_db_path("xref-indexer-incremental-db");
+    let conn = index.save_to_db(&db_path).expect("save should succeed");
+    drop(conn);
+
+    let clean = indexer
+        .reindex_db(&db_path)
+        .expect("clean reindex should succeed");
+    assert_eq!(clean.metrics.files_indexed, 0);
+    assert_eq!(clean.metrics.files_unchanged, 2);
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("b.cpp"))
+        .expect("open b.cpp")
+        .write_all(b"// comment-only change\n")
+        .expect("append comment");
+    let comment_only = indexer
+        .reindex_db(&db_path)
+        .expect("comment-only reindex should succeed");
+    assert_eq!(comment_only.metrics.files_indexed, 1);
+    assert_eq!(
+        comment_only.metrics.total_definitions,
+        index.definition_count()
+    );
+
+    let clean_after_comment = indexer
+        .reindex_db(&db_path)
+        .expect("clean reindex after comment should succeed");
+    assert_eq!(clean_after_comment.metrics.files_indexed, 0);
+
+    std::fs::write(
+        root.join("a.cpp"),
+        "int alpha() { return 1; }\nint added_symbol() { return alpha(); }\n",
+    )
+    .expect("modify a.cpp");
+
+    let changed = indexer
+        .reindex_db(&db_path)
+        .expect("incremental reindex should succeed");
+    assert_eq!(changed.metrics.files_indexed, 1);
+    assert_eq!(changed.metrics.files_modified, 1);
+    assert_eq!(changed.metrics.files_unchanged, 1);
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    let added_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM definitions WHERE name = 'added_symbol'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query added symbol");
+    assert_eq!(added_count, 1);
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_cli_queries_saved_sqlite_db() {
     let index = fixture_index();
     let db_path = unique_db_path("xref-indexer-cli-query");
@@ -511,6 +581,60 @@ fn test_cli_queries_saved_sqlite_db() {
     );
 
     let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_cli_query_auto_reindexes_saved_roots() {
+    let root = unique_db_path("xref-indexer-auto-root");
+    std::fs::create_dir_all(&root).expect("create temp root");
+    std::fs::write(
+        root.join("a.cpp"),
+        "int before_query_change() { return 1; }\n",
+    )
+    .expect("write source");
+
+    let db_path = unique_db_path("xref-indexer-auto-db");
+    let root_arg = root.to_string_lossy().to_string();
+    let db_arg = db_path.to_string_lossy().to_string();
+    let indexed = run_cli_json(&["index", "--root", &root_arg, "--db", &db_arg]);
+    assert_eq!(indexed["ok"], true);
+
+    std::fs::write(
+        root.join("a.cpp"),
+        "int before_query_change() { return 1; }\nint added_from_query() { return before_query_change(); }\n",
+    )
+    .expect("modify source");
+
+    let find = run_cli_json(&[
+        "find",
+        "--db",
+        &db_arg,
+        "added_from_query",
+        "--limit",
+        "5",
+        "--no-snippets",
+    ]);
+    assert_eq!(find["ok"], true);
+    assert_eq!(find["reindex"]["checked"], true);
+    assert_eq!(find["reindex"]["source"], "saved_config");
+    assert_eq!(find["reindex"]["metrics"]["files_indexed"], 1);
+    assert_eq!(find["result_count"], 1);
+    assert_eq!(find["results"][0]["definition"]["name"], "added_from_query");
+
+    let clean = run_cli_json(&[
+        "find",
+        "--db",
+        &db_arg,
+        "added_from_query",
+        "--limit",
+        "5",
+        "--no-snippets",
+    ]);
+    assert_eq!(clean["reindex"]["checked"], true);
+    assert_eq!(clean["reindex"]["metrics"]["files_indexed"], 0);
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

@@ -38,6 +38,16 @@ struct DbReference {
     context: Option<String>,
 }
 
+#[derive(Debug)]
+struct AutoReindexConfig {
+    roots: Vec<PathBuf>,
+    language: Language,
+    follow_symlinks: bool,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+    source: &'static str,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
@@ -53,6 +63,7 @@ fn main() {
 
     let result = match command.as_str() {
         "index" => cmd_index(&parsed),
+        "reindex" | "update" => cmd_reindex(&parsed),
         "bench" | "benchmark" => cmd_benchmark(&parsed),
         "stats" => cmd_stats(&parsed),
         "find" | "def" | "definitions" => cmd_find(&parsed),
@@ -140,6 +151,10 @@ impl ParsedArgs {
             .unwrap_or(false)
     }
 
+    fn has_flag(&self, name: &str) -> bool {
+        self.flags.contains_key(name)
+    }
+
     fn required_value(&self, name: &str) -> Result<&str, String> {
         self.value(name)
             .ok_or_else(|| format!("missing required --{name}"))
@@ -179,18 +194,11 @@ impl ParsedArgs {
         if self.bool_flag("all-references") {
             return Ok(ReferenceMode::All);
         }
-        match self
-            .value("references")
-            .or_else(|| self.value("reference-mode"))
-            .unwrap_or("calls")
-        {
-            "none" | "off" | "false" | "0" => Ok(ReferenceMode::None),
-            "calls" | "call" | "call-sites" => Ok(ReferenceMode::Calls),
-            "all" | "identifiers" | "full" => Ok(ReferenceMode::All),
-            other => Err(format!(
-                "unsupported reference mode '{other}'; use none, calls, or all"
-            )),
-        }
+        parse_reference_mode(
+            self.value("references")
+                .or_else(|| self.value("reference-mode"))
+                .unwrap_or("calls"),
+        )
     }
 }
 
@@ -207,6 +215,10 @@ fn roots_from_args(args: &ParsedArgs, command: &str) -> Result<Vec<PathBuf>, Str
 }
 
 fn cmd_index(args: &ParsedArgs) -> Result<Value, String> {
+    if args.bool_flag("incremental") {
+        return cmd_reindex(args);
+    }
+
     let roots = roots_from_args(args, "index")?;
 
     let language = parse_language(args.value("language").or_else(|| args.value("lang")))?;
@@ -229,9 +241,19 @@ fn cmd_index(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
     ensure_db_parent(db)?;
     let save_start = Instant::now();
-    run.index
+    let conn = run
+        .index
         .save_to_db(db)
         .map_err(|e| format!("failed to save database '{db}': {e}"))?;
+    xref_indexer::db::save_index_config(
+        &conn,
+        &roots,
+        language_name(language),
+        args.bool_flag("follow-symlinks"),
+        reference_mode_name(args.reference_mode()?),
+        args.bool_flag("reference-context"),
+    )
+    .map_err(|e| format!("failed to save index roots: {e}"))?;
     let save_ms = save_start.elapsed().as_millis();
     let index_ms = run.metrics.total_ms;
 
@@ -245,6 +267,39 @@ fn cmd_index(args: &ParsedArgs) -> Result<Value, String> {
         "metrics": run.metrics,
         "save_ms": save_ms,
         "total_ms": index_ms + save_ms,
+    }))
+}
+
+fn cmd_reindex(args: &ParsedArgs) -> Result<Value, String> {
+    let roots = roots_from_args(args, "reindex")?;
+    let language = parse_language(args.value("language").or_else(|| args.value("lang")))?;
+    let db = args.db_path();
+    ensure_db_parent(db)?;
+
+    let mut builder = Indexer::builder()
+        .language(language)
+        .follow_symlinks(args.bool_flag("follow-symlinks"))
+        .reference_mode(args.reference_mode()?)
+        .reference_context(args.bool_flag("reference-context"));
+    if let Some(threads) = args.threads() {
+        builder = builder.threads(threads);
+    }
+    for root in &roots {
+        builder = builder.add_directory(root);
+    }
+
+    let run = builder
+        .build()
+        .reindex_db(db)
+        .map_err(|e| format!("reindex failed: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "command": "reindex",
+        "db": db,
+        "roots": roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        "language": language_name(language),
+        "metrics": run.metrics,
     }))
 }
 
@@ -276,19 +331,142 @@ fn cmd_benchmark(args: &ParsedArgs) -> Result<Value, String> {
     }))
 }
 
+fn maybe_auto_reindex(args: &ParsedArgs) -> Result<Value, String> {
+    if args.bool_flag("no-reindex") || args.bool_flag("no-auto-reindex") {
+        return Ok(json!({
+            "checked": false,
+            "reason": "disabled",
+        }));
+    }
+
+    let db = args.db_path();
+    let config = match auto_reindex_config(args, db)? {
+        Some(config) => config,
+        None => {
+            return Ok(json!({
+                "checked": false,
+                "reason": "no_saved_roots",
+            }));
+        }
+    };
+
+    ensure_db_parent(db)?;
+    let mut builder = Indexer::builder()
+        .language(config.language)
+        .follow_symlinks(config.follow_symlinks)
+        .reference_mode(config.reference_mode)
+        .reference_context(config.include_reference_context);
+    if let Some(threads) = args.threads() {
+        builder = builder.threads(threads);
+    }
+    for root in &config.roots {
+        builder = builder.add_directory(root);
+    }
+
+    let run = builder
+        .build()
+        .reindex_db(db)
+        .map_err(|e| format!("auto-reindex failed: {e}"))?;
+
+    Ok(json!({
+        "checked": true,
+        "source": config.source,
+        "db": db,
+        "roots": config.roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        "language": language_name(config.language),
+        "metrics": run.metrics,
+    }))
+}
+
+fn auto_reindex_config(args: &ParsedArgs, db: &str) -> Result<Option<AutoReindexConfig>, String> {
+    let explicit_roots = query_roots_from_args(args);
+    if !explicit_roots.is_empty() {
+        return Ok(Some(AutoReindexConfig {
+            roots: explicit_roots,
+            language: parse_language(args.value("language").or_else(|| args.value("lang")))?,
+            follow_symlinks: args.bool_flag("follow-symlinks"),
+            reference_mode: args.reference_mode()?,
+            include_reference_context: args.bool_flag("reference-context"),
+            source: "query_args",
+        }));
+    }
+
+    if !Path::new(db).exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("failed to open database '{db}' for auto-reindex: {e}"))?;
+    let stored = xref_indexer::db::load_index_config(&conn)
+        .map_err(|e| format!("failed to load saved index roots from '{db}': {e}"))?;
+    drop(conn);
+
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+
+    let language = parse_language(
+        args.value("language")
+            .or_else(|| args.value("lang"))
+            .or(Some(stored.language.as_str())),
+    )?;
+    let reference_mode = if has_reference_mode_override(args) {
+        args.reference_mode()?
+    } else {
+        parse_reference_mode(&stored.reference_mode)?
+    };
+    let follow_symlinks = if args.has_flag("follow-symlinks") {
+        args.bool_flag("follow-symlinks")
+    } else {
+        stored.follow_symlinks
+    };
+    let include_reference_context = if args.has_flag("reference-context") {
+        args.bool_flag("reference-context")
+    } else {
+        stored.include_reference_context
+    };
+
+    Ok(Some(AutoReindexConfig {
+        roots: stored.roots,
+        language,
+        follow_symlinks,
+        reference_mode,
+        include_reference_context,
+        source: "saved_config",
+    }))
+}
+
+fn query_roots_from_args(args: &ParsedArgs) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = args.values("root").map(PathBuf::from).collect();
+    roots.extend(args.values("path").map(PathBuf::from));
+    roots
+}
+
+fn has_reference_mode_override(args: &ParsedArgs) -> bool {
+    args.has_flag("all-references")
+        || args.has_flag("references")
+        || args.has_flag("reference-mode")
+}
+
 fn cmd_stats(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     Ok(json!({
         "ok": true,
         "command": "stats",
         "db": db,
+        "reindex": reindex,
         "summary": db_summary(&conn)?,
         "files": db_files(&conn)?,
     }))
 }
 
 fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
@@ -332,6 +510,7 @@ fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "find",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "result_count": results.len(),
         "results": results,
@@ -340,6 +519,7 @@ fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
 }
 
 fn cmd_search(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
@@ -356,6 +536,7 @@ fn cmd_search(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "search",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "result_count": results.len(),
         "results": results,
@@ -363,6 +544,7 @@ fn cmd_search(args: &ParsedArgs) -> Result<Value, String> {
 }
 
 fn cmd_refs(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
@@ -379,6 +561,7 @@ fn cmd_refs(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "refs",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "result_count": results.len(),
         "results": results,
@@ -386,6 +569,7 @@ fn cmd_refs(args: &ParsedArgs) -> Result<Value, String> {
 }
 
 fn cmd_callers(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
@@ -394,6 +578,7 @@ fn cmd_callers(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "callers",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "result_count": defs.len(),
         "results": owned_definition_hits_with_confidence(
@@ -406,6 +591,7 @@ fn cmd_callers(args: &ParsedArgs) -> Result<Value, String> {
 }
 
 fn cmd_callees(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
@@ -414,6 +600,7 @@ fn cmd_callees(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "callees",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "result_count": defs.len(),
         "results": owned_definition_hits_with_confidence(
@@ -426,6 +613,7 @@ fn cmd_callees(args: &ParsedArgs) -> Result<Value, String> {
 }
 
 fn cmd_hierarchy(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
@@ -434,6 +622,7 @@ fn cmd_hierarchy(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "hierarchy",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "bases": owned_definition_hits_with_confidence(
             &bases,
@@ -466,6 +655,7 @@ fn cmd_context(args: &ParsedArgs) -> Result<Value, String> {
     }
 
     let db = args.db_path();
+    let reindex = maybe_auto_reindex(args)?;
     let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
     let results: Vec<Value> = db_definitions_for_name(&conn, query, Some(args.limit()))?
@@ -482,6 +672,7 @@ fn cmd_context(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "context",
         "db": db,
+        "reindex": reindex,
         "query": query,
         "result_count": results.len(),
         "results": results,
@@ -489,6 +680,7 @@ fn cmd_context(args: &ParsedArgs) -> Result<Value, String> {
 }
 
 fn cmd_expand(args: &ParsedArgs) -> Result<Value, String> {
+    let reindex = maybe_auto_reindex(args)?;
     let db = args.db_path();
     let conn = open_query_conn(db)?;
     let seed = args.first_symbol()?;
@@ -541,6 +733,7 @@ fn cmd_expand(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "expand",
         "db": db,
+        "reindex": reindex,
         "seed": seed,
         "direction": direction,
         "depth": depth,
@@ -572,6 +765,7 @@ fn cmd_sql(args: &ParsedArgs) -> Result<Value, String> {
         );
     }
 
+    let reindex = maybe_auto_reindex(args)?;
     let conn = open_query_conn(db)?;
     let mut stmt = conn
         .prepare(&sql)
@@ -600,6 +794,7 @@ fn cmd_sql(args: &ParsedArgs) -> Result<Value, String> {
         "ok": true,
         "command": "sql",
         "db": db,
+        "reindex": reindex,
         "columns": columns,
         "row_count": rows.len(),
         "rows": rows,
@@ -1151,6 +1346,25 @@ fn language_name(language: Language) -> &'static str {
     }
 }
 
+fn parse_reference_mode(value: &str) -> Result<ReferenceMode, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" | "off" | "false" | "0" => Ok(ReferenceMode::None),
+        "calls" | "call" | "call-sites" => Ok(ReferenceMode::Calls),
+        "all" | "identifiers" | "full" => Ok(ReferenceMode::All),
+        other => Err(format!(
+            "unsupported reference mode '{other}'; use none, calls, or all"
+        )),
+    }
+}
+
+fn reference_mode_name(reference_mode: ReferenceMode) -> &'static str {
+    match reference_mode {
+        ReferenceMode::None => "none",
+        ReferenceMode::Calls => "calls",
+        ReferenceMode::All => "all",
+    }
+}
+
 fn index_summary(index: &Index) -> Value {
     json!({
         "files": index.files().len(),
@@ -1361,21 +1575,23 @@ Default database: ./.git/code-indexer/xrefs.sqlite3
 
 Commands:
   index --root PATH [--db index.db] [--language cpp|c] [--threads N] [--references calls|all|none]
+  reindex --root PATH [--db index.db] [--language cpp|c] [--threads N] [--references calls|all|none]
   bench --root PATH [--db index.db|--save] [--no-save] [--threads N] [--references calls|all|none]
-  stats [--db index.db]
-  find [--db index.db] SYMBOL [--limit N] [--context N] [--include-search]
-  search [--db index.db] PATTERN [--limit N] [--context N]
-  refs [--db index.db] SYMBOL [--limit N] [--context N]
-  callers [--db index.db] SYMBOL [--limit N] [--context N]
-  callees [--db index.db] SYMBOL [--limit N] [--context N]
-  hierarchy [--db index.db] CLASS [--context N]
+  stats [--db index.db] [--root PATH] [--no-reindex]
+  find [--db index.db] SYMBOL [--limit N] [--context N] [--include-search] [--root PATH] [--no-reindex]
+  search [--db index.db] PATTERN [--limit N] [--context N] [--root PATH] [--no-reindex]
+  refs [--db index.db] SYMBOL [--limit N] [--context N] [--root PATH] [--no-reindex]
+  callers [--db index.db] SYMBOL [--limit N] [--context N] [--root PATH] [--no-reindex]
+  callees [--db index.db] SYMBOL [--limit N] [--context N] [--root PATH] [--no-reindex]
+  hierarchy [--db index.db] CLASS [--context N] [--root PATH] [--no-reindex]
   context --file PATH --line N [--context N]
-  context [--db index.db] SYMBOL [--limit N] [--context N]
-  expand [--db index.db] SYMBOL [--direction callers|callees|both] [--depth N] [--limit N]
-  sql [--db index.db] --sql "SELECT name, qualified_name FROM definitions LIMIT 5"
+  context [--db index.db] SYMBOL [--limit N] [--context N] [--root PATH] [--no-reindex]
+  expand [--db index.db] SYMBOL [--direction callers|callees|both] [--depth N] [--limit N] [--root PATH] [--no-reindex]
+  sql [--db index.db] --sql "SELECT name, qualified_name FROM definitions LIMIT 5" [--root PATH] [--no-reindex]
 
 LLM workflow examples:
   xref-indexer index --root ./tests/fixtures
+  xref-indexer reindex --root ./tests/fixtures
   xref-indexer bench --root ./test-data --db /tmp/xrefs-bench.sqlite3 --pretty
   xref-indexer find demo::Derived::run --pretty
   xref-indexer callers compute --pretty
@@ -1383,6 +1599,9 @@ LLM workflow examples:
 
 Notes:
   - This is a Tree-sitter structural index, not a compiler oracle.
+  - reindex parses only files whose checksums changed since the last saved DB update.
+  - DB-backed queries run an incremental reindex check first using saved roots.
+  - Pass --no-reindex to query the current DB without checking the filesystem.
   - bench is no-save by default unless --db or --save is provided.
   - Default references mode is calls; use --references all for exhaustive identifier refs.
   - Per-reference source context is disabled during indexing unless --reference-context is set.

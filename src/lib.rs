@@ -6,7 +6,9 @@ pub mod types;
 
 pub mod db {
     //! SQLite persistence for the cross-reference index.
-    pub use crate::db_impl::{create_schema, open_from_db, save_to_db};
+    pub use crate::db_impl::{
+        create_schema, load_index_config, open_from_db, save_index_config, save_to_db, IndexConfig,
+    };
 }
 mod db_impl;
 
@@ -16,6 +18,7 @@ pub mod query {
     pub use crate::index::ClassHierarchy;
 }
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -28,6 +31,7 @@ use walkdir::WalkDir;
 pub use crate::index::Index;
 
 use crate::cpp_parser::CppParser;
+use crate::db_impl::{IncrementalChecksumUpdate, IncrementalFileUpdate};
 use crate::index::IndexBuilder;
 use crate::parser::Parser;
 
@@ -56,6 +60,40 @@ pub struct IndexMetrics {
 pub struct IndexedRun {
     pub index: Index,
     pub metrics: IndexMetrics,
+}
+
+/// Timings and counts from an incremental database reindex.
+#[derive(Debug, Clone, Serialize)]
+pub struct IncrementalMetrics {
+    pub threads: usize,
+    pub files_discovered: usize,
+    pub files_unchanged: usize,
+    pub files_new: usize,
+    pub files_modified: usize,
+    pub files_removed: usize,
+    pub files_indexed: usize,
+    pub bytes_scanned: u64,
+    pub bytes_read: u64,
+    pub lossy_decoded_files: usize,
+    pub definitions: usize,
+    pub references: usize,
+    pub calls: usize,
+    pub inheritance_edges: usize,
+    pub total_files: usize,
+    pub total_definitions: usize,
+    pub total_references: usize,
+    pub total_calls: usize,
+    pub total_inheritance_edges: usize,
+    pub discover_ms: u128,
+    pub checksum_ms: u128,
+    pub parse_ms: u128,
+    pub db_update_ms: u128,
+    pub total_ms: u128,
+}
+
+/// Result of an incremental reindex into an existing SQLite database.
+pub struct IncrementalRun {
+    pub metrics: IncrementalMetrics,
 }
 
 /// How much reference data to collect in addition to definitions and call edges.
@@ -225,6 +263,35 @@ impl Indexer {
             .join()
             .map_err(|_| "indexer thread panicked".to_string())?
     }
+
+    /// Update a SQLite database by parsing only new or changed files.
+    pub fn reindex_db(&self, db_path: impl AsRef<Path>) -> Result<IncrementalRun, String> {
+        let paths = self.paths.clone();
+        let db_path = db_path.as_ref().to_path_buf();
+        let language = self.language;
+        let follow_symlinks = self.follow_symlinks;
+        let threads = self.threads;
+        let reference_mode = self.reference_mode;
+        let include_reference_context = self.include_reference_context;
+
+        std::thread::Builder::new()
+            .name("xref-indexer".to_string())
+            .stack_size(INDEXER_STACK_SIZE)
+            .spawn(move || {
+                reindex_paths_to_db(
+                    paths,
+                    db_path,
+                    language,
+                    follow_symlinks,
+                    threads,
+                    reference_mode,
+                    include_reference_context,
+                )
+            })
+            .map_err(|e| format!("failed to start indexer thread: {e}"))?
+            .join()
+            .map_err(|_| "indexer thread panicked".to_string())?
+    }
 }
 
 fn index_paths(
@@ -308,6 +375,311 @@ fn index_paths(
         metrics.threads
     );
     Ok(IndexedRun { index, metrics })
+}
+
+#[derive(Clone)]
+struct FileSnapshot {
+    path: PathBuf,
+    language: String,
+    checksum: String,
+    bytes: u64,
+}
+
+struct DbFileRecord {
+    checksum: Option<String>,
+    symbols_checksum: Option<String>,
+    language: String,
+}
+
+fn reindex_paths_to_db(
+    paths: Vec<PathBuf>,
+    db_path: PathBuf,
+    language: Language,
+    follow_symlinks: bool,
+    threads: Option<usize>,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+) -> Result<IncrementalRun, String> {
+    let total_start = Instant::now();
+    let discover_start = Instant::now();
+    let files = discover_files(&paths, language, follow_symlinks)?;
+    let discover_ms = discover_start.elapsed().as_millis();
+    let files_discovered = files.len();
+
+    let checksum_start = Instant::now();
+    let snapshots = checksum_files(files, language)?;
+    let checksum_ms = checksum_start.elapsed().as_millis();
+    let bytes_scanned = snapshots.iter().map(|file| file.bytes).sum();
+
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create database directory '{}': {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    let mut conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| format!("failed to open database '{}': {e}", db_path.display()))?;
+    crate::db_impl::create_schema(&conn)
+        .map_err(|e| format!("failed to prepare database '{}': {e}", db_path.display()))?;
+    crate::db_impl::save_index_config(
+        &conn,
+        &paths,
+        language_name(language),
+        follow_symlinks,
+        reference_mode_name(reference_mode),
+        include_reference_context,
+    )
+    .map_err(|e| format!("failed to save index roots: {e}"))?;
+
+    let db_records = load_db_file_records(&conn)
+        .map_err(|e| format!("failed to load database file records: {e}"))?;
+    let current_paths: HashSet<PathBuf> = snapshots.iter().map(|file| file.path.clone()).collect();
+    let removed_paths: Vec<PathBuf> = db_records
+        .keys()
+        .filter(|path| !current_paths.contains(*path))
+        .cloned()
+        .collect();
+
+    let mut files_new = 0;
+    let mut files_modified = 0;
+    let mut to_parse = Vec::new();
+    for snapshot in &snapshots {
+        match db_records.get(&snapshot.path) {
+            Some(record)
+                if record.checksum.as_deref() == Some(snapshot.checksum.as_str())
+                    && record.language == snapshot.language => {}
+            Some(_) => {
+                files_modified += 1;
+                to_parse.push(snapshot.clone());
+            }
+            None => {
+                files_new += 1;
+                to_parse.push(snapshot.clone());
+            }
+        }
+    }
+
+    let worker_count = worker_count(threads, to_parse.len());
+    let parse_start = Instant::now();
+    let parsed = parse_files(
+        to_parse.iter().map(|file| file.path.clone()).collect(),
+        language,
+        worker_count,
+        reference_mode,
+        include_reference_context,
+    )?;
+    let parse_ms = parse_start.elapsed().as_millis();
+
+    let files_indexed = parsed.files.len();
+    let bytes_read = parsed.bytes_read;
+    let lossy_decoded_files = parsed.lossy_decoded_files;
+    let definitions = parsed
+        .files
+        .iter()
+        .map(|f| f.symbols.definitions.len())
+        .sum();
+    let references = parsed
+        .files
+        .iter()
+        .map(|f| f.symbols.references.len())
+        .sum();
+    let calls = parsed.files.iter().map(|f| f.symbols.calls.len()).sum();
+    let inheritance_edges = parsed.files.iter().map(|f| f.symbols.inherits.len()).sum();
+
+    let checksums: HashMap<PathBuf, String> = snapshots
+        .iter()
+        .map(|file| (file.path.clone(), file.checksum.clone()))
+        .collect();
+    let mut checksum_only_updates = Vec::new();
+    let mut symbols_checksums: HashMap<PathBuf, String> = HashMap::new();
+    for file in &parsed.files {
+        let symbols_checksum = crate::db_impl::file_symbols_checksum(&file.symbols);
+        let current_checksum = checksums
+            .get(&file.symbols.file)
+            .map(String::as_str)
+            .unwrap_or("");
+        if db_records
+            .get(&file.symbols.file)
+            .and_then(|record| record.symbols_checksum.as_deref())
+            == Some(symbols_checksum.as_str())
+        {
+            checksum_only_updates.push((
+                file.symbols.file.clone(),
+                current_checksum.to_string(),
+                symbols_checksum,
+            ));
+        } else {
+            symbols_checksums.insert(file.symbols.file.clone(), symbols_checksum);
+        }
+    }
+
+    let db_update_start = Instant::now();
+    if !parsed.files.is_empty() || !removed_paths.is_empty() {
+        let checksum_updates: Vec<IncrementalChecksumUpdate<'_>> = checksum_only_updates
+            .iter()
+            .map(
+                |(path, checksum, symbols_checksum)| IncrementalChecksumUpdate {
+                    path,
+                    checksum,
+                    symbols_checksum,
+                },
+            )
+            .collect();
+        let updates: Vec<IncrementalFileUpdate<'_>> = parsed
+            .files
+            .iter()
+            .filter(|file| symbols_checksums.contains_key(&file.symbols.file))
+            .map(|file| {
+                let checksum = checksums
+                    .get(&file.symbols.file)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let symbols_checksum = symbols_checksums
+                    .get(&file.symbols.file)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                IncrementalFileUpdate {
+                    symbols: &file.symbols,
+                    checksum,
+                    symbols_checksum,
+                }
+            })
+            .collect();
+        crate::db_impl::apply_incremental_update(
+            &mut conn,
+            &updates,
+            &checksum_updates,
+            &removed_paths,
+        )
+        .map_err(|e| format!("failed to apply incremental database update: {e}"))?;
+    }
+    let db_update_ms = db_update_start.elapsed().as_millis();
+
+    let (total_files, total_definitions, total_references, total_calls, total_inheritance_edges) =
+        db_counts(&conn).map_err(|e| format!("failed to read database counts: {e}"))?;
+
+    let metrics = IncrementalMetrics {
+        threads: worker_count,
+        files_discovered,
+        files_unchanged: files_discovered.saturating_sub(files_new + files_modified),
+        files_new,
+        files_modified,
+        files_removed: removed_paths.len(),
+        files_indexed,
+        bytes_scanned,
+        bytes_read,
+        lossy_decoded_files,
+        definitions,
+        references,
+        calls,
+        inheritance_edges,
+        total_files,
+        total_definitions,
+        total_references,
+        total_calls,
+        total_inheritance_edges,
+        discover_ms,
+        checksum_ms,
+        parse_ms,
+        db_update_ms,
+        total_ms: total_start.elapsed().as_millis(),
+    };
+
+    eprintln!(
+        "Reindexed {} changed/new files in {} ms (discover {} ms, checksum {} ms, parse {} ms, db {} ms, unchanged {}, removed {}, threads {})",
+        metrics.files_indexed,
+        metrics.total_ms,
+        metrics.discover_ms,
+        metrics.checksum_ms,
+        metrics.parse_ms,
+        metrics.db_update_ms,
+        metrics.files_unchanged,
+        metrics.files_removed,
+        metrics.threads
+    );
+    Ok(IncrementalRun { metrics })
+}
+
+fn checksum_files(files: Vec<PathBuf>, language: Language) -> Result<Vec<FileSnapshot>, String> {
+    let language = language_name(language).to_string();
+    files
+        .into_iter()
+        .map(|path| {
+            let (checksum, bytes) = crate::db_impl::checksum_path(&path)
+                .map_err(|e| format!("failed to checksum {}: {e}", path.display()))?;
+            Ok(FileSnapshot {
+                path,
+                language: language.clone(),
+                checksum,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn load_db_file_records(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<HashMap<PathBuf, DbFileRecord>> {
+    let mut stmt = conn.prepare("SELECT path, language, checksum, symbols_checksum FROM files")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            PathBuf::from(row.get::<_, String>(0)?),
+            DbFileRecord {
+                language: row.get(1)?,
+                checksum: row.get(2)?,
+                symbols_checksum: row.get(3)?,
+            },
+        ))
+    })?;
+    let mut records = HashMap::new();
+    for row in rows {
+        let (path, record) = row?;
+        records.insert(path, record);
+    }
+    Ok(records)
+}
+
+fn db_counts(conn: &rusqlite::Connection) -> rusqlite::Result<(usize, usize, usize, usize, usize)> {
+    conn.query_row(
+        "
+        SELECT
+            (SELECT COUNT(*) FROM files),
+            (SELECT COUNT(*) FROM definitions),
+            (SELECT COUNT(*) FROM refs),
+            (SELECT COUNT(*) FROM call_graph),
+            (SELECT COUNT(*) FROM inheritance)
+        ",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as usize,
+            ))
+        },
+    )
+}
+
+fn language_name(language: Language) -> &'static str {
+    match language {
+        Language::C => "c",
+        Language::Cpp => "cpp",
+    }
+}
+
+fn reference_mode_name(reference_mode: ReferenceMode) -> &'static str {
+    match reference_mode {
+        ReferenceMode::None => "none",
+        ReferenceMode::Calls => "calls",
+        ReferenceMode::All => "all",
+    }
 }
 
 fn discover_files(

@@ -79,9 +79,24 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport, String> {
 
     let save = if let Some(db_path) = &config.db_path {
         let save_start = Instant::now();
-        run.index
+        let conn = run
+            .index
             .save_to_db(db_path)
             .map_err(|e| format!("benchmark save failed for '{}': {e}", db_path.display()))?;
+        crate::db_impl::save_index_config(
+            &conn,
+            &config.roots,
+            language_name(config.language),
+            config.follow_symlinks,
+            reference_mode_name(config.reference_mode),
+            config.include_reference_context,
+        )
+        .map_err(|e| {
+            format!(
+                "benchmark save roots failed for '{}': {e}",
+                db_path.display()
+            )
+        })?;
         Some(SaveMetrics {
             db: db_path.to_string_lossy().to_string(),
             save_ms: save_start.elapsed().as_millis(),
@@ -111,5 +126,13 @@ fn language_name(language: Language) -> &'static str {
     match language {
         Language::C => "c",
         Language::Cpp => "cpp",
+    }
+}
+
+fn reference_mode_name(reference_mode: ReferenceMode) -> &'static str {
+    match reference_mode {
+        ReferenceMode::None => "none",
+        ReferenceMode::Calls => "calls",
+        ReferenceMode::All => "all",
     }
 }

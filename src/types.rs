@@ -133,6 +133,7 @@ pub struct CallEdge {
 pub struct InheritEdge {
     pub derived_name: String,
     pub base_name: String,
+    pub location: Location,
     pub access: Visibility,
     pub is_virtual: bool,
 }
