@@ -143,6 +143,8 @@ pub struct InheritEdge {
 pub struct IndexedFile {
     pub path: PathBuf,
     pub language: String,
+    pub checksum: Option<String>,
+    pub symbols_checksum: Option<String>,
 }
 
 #[derive(Debug, Clone)]

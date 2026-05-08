@@ -67,7 +67,7 @@ DB-backed query commands run an incremental reindex check before reading SQLite.
 
 The CLI reports confidence/provenance-style fields such as `exact_qualified`, `exact_simple`, `substring`, `resolved_unique_name`, and `structural_call`. The index is Tree-sitter based, so treat results as fast structural candidates rather than compiler-perfect C++ semantic facts.
 
-The default reference mode is `--references calls`, which stores definitions, call graph edges, and call-site refs. Use `--references all` for exhaustive identifier refs, or `--references none` when the call graph table is enough. Per-reference source-line context is disabled by default; use `context`/snippets for lazy source text, or pass `--reference-context` for the heavier legacy behavior.
+The default reference mode is `--references none`, which stores definitions, call graph edges, and class inheritance without duplicating call sites in `refs`. Use `--references calls` when the `refs` command should return call-site references, or `--references all` for exhaustive identifier refs. Per-reference source-line context is disabled by default; use `context`/snippets for lazy source text, or pass `--reference-context` for the heavier legacy behavior.
 
 ## Performance benchmarking
 
@@ -76,15 +76,15 @@ The library exposes `Indexer::index_with_metrics()` and `xref_indexer::benchmark
 On the local 10,010-file downloaded C++ corpus in `test-data`, release-mode first-run timing with the default fast reference mode was:
 
 ```text
-files=10010 definitions=629972 calls=847774 refs=827067
-index=9792ms save=8394ms total=18187ms
+files=10010 definitions=629972 calls=847774 refs=0
+index=8983ms sqlite_writer=13810ms total=13952ms
 ```
 
-The high-level CLI lookup commands query SQLite directly instead of hydrating the full index into memory per invocation. With `--no-reindex` on the same 302 MB large index DB, representative release-mode raw query timings were `find` 3 ms, `refs` 3 ms, `callers` 3 ms, `callees` 5 ms, `search` 7 ms, `hierarchy` 24 ms, `stats` 34 ms, and `expand --depth 2 --limit 20` 124 ms.
+Full CLI indexing streams parsed files into a single SQLite writer while parser workers are still running. The writer inserts files and definitions during parsing, then inserts resolved refs/calls/inheritance and creates SQLite indexes at the end. `sqlite_writer` overlaps with `index`, so the timings are not additive. In the run above, the writer spent `668ms` inserting resolved refs/calls/inheritance and `3221ms` creating SQLite indexes after parsing. Full indexing also computes file-content checksums and symbol-output fingerprints in the parallel parse stage, so SQLite persistence does not re-read every source file.
+
+The high-level CLI lookup commands query SQLite directly instead of hydrating the full index into memory per invocation. With `--no-reindex` on the large index DB, representative release-mode raw query timings were `find` 3 ms, `callers` 3 ms, `callees` 5 ms, `search` 7 ms, `hierarchy` 24 ms, `stats` 34 ms, and `expand --depth 2 --limit 20` 124 ms. The `refs` command requires an index built with `--references calls` or `--references all`.
 
 Incremental `reindex` stores both content checksums and symbol-output fingerprints per file. DB-backed query commands run the same incremental check automatically before answering. The checksum scan is parallel and keeps decoded source for changed files, so changed files are not read again before parsing. A clean auto-reindexed `find` against the large DB checked 10,010 indexed files, parsed 0, and answered with `reindex.metrics.total_ms=209` (`discover=115ms checksum=54ms`). After appending comments to 250 random C/C++ files with `scripts/modify-random.py`, the same query parsed 223 changed indexed files and updated the DB before lookup in `517ms` total (`discover=122ms checksum=71ms parse=247ms db=3ms`) because the parsed symbols were unchanged.
-
-For the leanest first run, `--references none` keeps `call_graph` but skips the duplicate call-site `refs` rows; on the same corpus that mode measured `total=13442ms`.
 
 ## SQLite schema
 
@@ -119,8 +119,8 @@ CREATE TABLE definitions (
     extra TEXT                      -- JSON for language-specific data
 );
 
--- Symbol references. Default mode stores call-site refs; --references all stores
--- exhaustive identifier-like refs.
+-- Symbol references. Default mode leaves this empty; --references calls stores
+-- call-site refs, and --references all stores exhaustive identifier-like refs.
 CREATE TABLE refs (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,

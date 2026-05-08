@@ -32,7 +32,9 @@ use walkdir::WalkDir;
 pub use crate::index::Index;
 
 use crate::cpp_parser::CppParser;
-use crate::db_impl::{IncrementalChecksumUpdate, IncrementalFileUpdate};
+use crate::db_impl::{
+    IncrementalChecksumUpdate, IncrementalFileUpdate, StreamedDbWriteMetrics, StreamedFileSymbols,
+};
 use crate::index::IndexBuilder;
 use crate::parser::Parser;
 
@@ -61,6 +63,24 @@ pub struct IndexMetrics {
 pub struct IndexedRun {
     pub index: Index,
     pub metrics: IndexMetrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DbIndexSummary {
+    pub files: usize,
+    pub definitions: usize,
+    pub references: usize,
+    pub calls: usize,
+    pub inheritance_edges: usize,
+}
+
+/// Result of streaming a full index directly into SQLite.
+pub struct IndexedDbRun {
+    pub metrics: IndexMetrics,
+    pub summary: DbIndexSummary,
+    pub save_ms: u128,
+    pub writer: StreamedDbWriteMetrics,
+    pub total_ms: u128,
 }
 
 /// Timings and counts from an incremental database reindex.
@@ -101,8 +121,9 @@ pub struct IncrementalRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ReferenceMode {
     /// Do not populate the refs table. Call graph edges are still collected.
+    /// This is the default fast mode.
     None,
-    /// Populate refs for call targets only. This is the default fast mode.
+    /// Populate refs for call targets only.
     Calls,
     /// Populate refs for all identifier-like Tree-sitter nodes.
     All,
@@ -160,7 +181,7 @@ impl IndexerBuilder {
             language: Language::Cpp,
             follow_symlinks: false,
             threads: None,
-            reference_mode: ReferenceMode::Calls,
+            reference_mode: ReferenceMode::None,
             include_reference_context: false,
         }
     }
@@ -293,6 +314,35 @@ impl Indexer {
             .join()
             .map_err(|_| "indexer thread panicked".to_string())?
     }
+
+    /// Run a full index and stream parsed files directly into SQLite.
+    pub fn index_db(&self, db_path: impl AsRef<Path>) -> Result<IndexedDbRun, String> {
+        let paths = self.paths.clone();
+        let db_path = db_path.as_ref().to_path_buf();
+        let language = self.language;
+        let follow_symlinks = self.follow_symlinks;
+        let threads = self.threads;
+        let reference_mode = self.reference_mode;
+        let include_reference_context = self.include_reference_context;
+
+        std::thread::Builder::new()
+            .name("xref-indexer".to_string())
+            .stack_size(INDEXER_STACK_SIZE)
+            .spawn(move || {
+                index_paths_to_db(
+                    paths,
+                    db_path,
+                    language,
+                    follow_symlinks,
+                    threads,
+                    reference_mode,
+                    include_reference_context,
+                )
+            })
+            .map_err(|e| format!("failed to start indexer thread: {e}"))?
+            .join()
+            .map_err(|_| "indexer thread panicked".to_string())?
+    }
 }
 
 fn index_paths(
@@ -345,7 +395,11 @@ fn index_paths(
         inheritance_edges,
     );
     for file in parsed.files {
-        builder.add_file(file.symbols);
+        builder.add_file_with_checksums(
+            file.symbols,
+            Some(file.checksum),
+            Some(file.symbols_checksum),
+        );
     }
     let index = builder.build();
     let build_ms = build_start.elapsed().as_millis();
@@ -376,6 +430,116 @@ fn index_paths(
         metrics.threads
     );
     Ok(IndexedRun { index, metrics })
+}
+
+fn index_paths_to_db(
+    paths: Vec<PathBuf>,
+    db_path: PathBuf,
+    language: Language,
+    follow_symlinks: bool,
+    threads: Option<usize>,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+) -> Result<IndexedDbRun, String> {
+    let total_start = Instant::now();
+    let discover_start = Instant::now();
+    let files = discover_files(&paths, language, follow_symlinks)?;
+    let discover_ms = discover_start.elapsed().as_millis();
+    let files_discovered = files.len();
+    let worker_count = worker_count(threads, files_discovered);
+
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create database directory '{}': {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let writer_db_path = db_path.clone();
+    let save_start = Instant::now();
+    let writer = std::thread::Builder::new()
+        .name("xref-indexer-db-writer".to_string())
+        .spawn(move || crate::db_impl::save_streamed_to_db(&writer_db_path, receiver))
+        .map_err(|e| format!("failed to start database writer thread: {e}"))?;
+
+    let parse_start = Instant::now();
+    let parsed = parse_files_streamed(
+        files,
+        language,
+        worker_count,
+        reference_mode,
+        include_reference_context,
+        sender,
+    );
+    let parse_ms = parse_start.elapsed().as_millis();
+    let index_ms = total_start.elapsed().as_millis();
+
+    let writer_result = writer
+        .join()
+        .map_err(|_| "database writer thread panicked".to_string())?;
+    let (conn, db_metrics, writer_metrics) = writer_result?;
+    let save_ms = save_start.elapsed().as_millis();
+
+    let parsed = parsed?;
+    crate::db_impl::save_index_config(
+        &conn,
+        &paths,
+        language_name(language),
+        follow_symlinks,
+        reference_mode_name(reference_mode),
+        include_reference_context,
+    )
+    .map_err(|e| format!("failed to save index roots: {e}"))?;
+
+    let (total_files, total_definitions, total_references, total_calls, total_inheritance_edges) =
+        db_counts(&conn).map_err(|e| format!("failed to read database counts: {e}"))?;
+    let summary = DbIndexSummary {
+        files: total_files,
+        definitions: total_definitions,
+        references: total_references,
+        calls: total_calls,
+        inheritance_edges: total_inheritance_edges,
+    };
+
+    let metrics = IndexMetrics {
+        threads: worker_count,
+        files_discovered,
+        files_indexed: parsed.files_indexed,
+        bytes_read: parsed.bytes_read,
+        lossy_decoded_files: parsed.lossy_decoded_files,
+        definitions: db_metrics.definitions_inserted,
+        references: db_metrics.references_inserted,
+        calls: db_metrics.calls_inserted,
+        inheritance_edges: db_metrics.inheritance_inserted,
+        discover_ms,
+        parse_ms,
+        build_ms: 0,
+        total_ms: index_ms,
+    };
+
+    eprintln!(
+        "Indexed {} files into {} in {} ms (discover {} ms, parse {} ms, save {} ms, threads {})",
+        metrics.files_indexed,
+        db_path.display(),
+        total_start.elapsed().as_millis(),
+        metrics.discover_ms,
+        metrics.parse_ms,
+        save_ms,
+        metrics.threads
+    );
+
+    Ok(IndexedDbRun {
+        metrics,
+        summary,
+        save_ms,
+        writer: writer_metrics,
+        total_ms: total_start.elapsed().as_millis(),
+    })
 }
 
 #[derive(Clone)]
@@ -518,7 +682,7 @@ fn reindex_paths_to_db(
     let mut checksum_only_updates = Vec::new();
     let mut symbols_checksums: HashMap<PathBuf, String> = HashMap::new();
     for file in &parsed.files {
-        let symbols_checksum = crate::db_impl::file_symbols_checksum(&file.symbols);
+        let symbols_checksum = file.symbols_checksum.clone();
         let current_checksum = checksums
             .get(&file.symbols.file)
             .map(String::as_str)
@@ -672,7 +836,9 @@ fn checksum_file(
     };
     let source = match change {
         FileChange::Unchanged => None,
-        FileChange::Modified | FileChange::New => Some(decode_source_lossy(&path, bytes)),
+        FileChange::Modified | FileChange::New => {
+            Some(decode_source_lossy(&path, bytes, checksum.clone()))
+        }
     };
 
     Ok(ScannedFile {
@@ -796,9 +962,18 @@ struct ParsedFiles {
     lossy_decoded_files: usize,
 }
 
+#[derive(Default)]
+struct ParsedFileStats {
+    files_indexed: usize,
+    bytes_read: u64,
+    lossy_decoded_files: usize,
+}
+
 struct ParsedFile {
     index: usize,
     symbols: crate::types::FileSymbols,
+    checksum: String,
+    symbols_checksum: String,
 }
 
 struct ParseInput {
@@ -809,6 +984,13 @@ struct ParseInput {
 struct SourceFile {
     source: String,
     bytes: usize,
+    checksum: String,
+    decoded_lossy: bool,
+}
+
+struct ParsedOneFile {
+    file: StreamedFileSymbols,
+    bytes_read: u64,
     decoded_lossy: bool,
 }
 
@@ -829,6 +1011,91 @@ fn parse_files(
         reference_mode,
         include_reference_context,
     )
+}
+
+fn parse_files_streamed(
+    files: Vec<PathBuf>,
+    language: Language,
+    threads: usize,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+    sender: mpsc::Sender<Result<StreamedFileSymbols, String>>,
+) -> Result<ParsedFileStats, String> {
+    parse_file_inputs_streamed(
+        files
+            .into_iter()
+            .map(|path| ParseInput { path, source: None })
+            .collect(),
+        language,
+        threads,
+        reference_mode,
+        include_reference_context,
+        sender,
+    )
+}
+
+fn parse_file_inputs_streamed(
+    inputs: Vec<ParseInput>,
+    language: Language,
+    threads: usize,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+    sender: mpsc::Sender<Result<StreamedFileSymbols, String>>,
+) -> Result<ParsedFileStats, String> {
+    if inputs.is_empty() {
+        drop(sender);
+        return Ok(ParsedFileStats::default());
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|worker_id| format!("xref-indexer-worker-{worker_id}"))
+        .stack_size(INDEXER_STACK_SIZE)
+        .build()
+        .map_err(|e| format!("failed to start parser worker pool: {e}"))?;
+
+    let inputs = Arc::new(inputs);
+    let next_file = Arc::new(AtomicUsize::new(0));
+    let (stats_sender, stats_receiver) = mpsc::channel();
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.scope(|scope| {
+            for _ in 0..threads {
+                let inputs = Arc::clone(&inputs);
+                let next_file = Arc::clone(&next_file);
+                let file_sender = sender.clone();
+                let stats_sender = stats_sender.clone();
+                scope.spawn(move |_| {
+                    let result = parse_stream_worker(
+                        inputs,
+                        next_file,
+                        language,
+                        reference_mode,
+                        include_reference_context,
+                        file_sender,
+                    );
+                    let _ = stats_sender.send(result);
+                });
+            }
+        });
+    }))
+    .map_err(|_| "parser worker panicked".to_string())?;
+    drop(sender);
+    drop(stats_sender);
+
+    let mut stats = ParsedFileStats::default();
+    for _ in 0..threads {
+        match stats_receiver.recv() {
+            Ok(Ok(batch)) => {
+                stats.files_indexed += batch.files_indexed;
+                stats.bytes_read += batch.bytes_read;
+                stats.lossy_decoded_files += batch.lossy_decoded_files;
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(format!("parser worker did not report results: {e}")),
+        }
+    }
+    Ok(stats)
 }
 
 fn parse_file_inputs(
@@ -897,6 +1164,76 @@ fn parse_file_inputs(
     Ok(parsed)
 }
 
+fn parse_stream_worker(
+    inputs: Arc<Vec<ParseInput>>,
+    next_file: Arc<AtomicUsize>,
+    language: Language,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+    sender: mpsc::Sender<Result<StreamedFileSymbols, String>>,
+) -> Result<ParsedFileStats, String> {
+    let mut parser = language.parser(reference_mode, include_reference_context);
+    let mut stats = ParsedFileStats::default();
+
+    loop {
+        let start = next_file.fetch_add(PARSE_CHUNK_SIZE, Ordering::Relaxed);
+        if start >= inputs.len() {
+            break;
+        }
+        let end = (start + PARSE_CHUNK_SIZE).min(inputs.len());
+
+        for index in start..end {
+            let input = &inputs[index];
+            let parsed = parse_one_input(index, input, &mut *parser);
+            match parsed {
+                Ok(parsed) => {
+                    stats.files_indexed += 1;
+                    stats.bytes_read += parsed.bytes_read;
+                    stats.lossy_decoded_files += usize::from(parsed.decoded_lossy);
+                    sender
+                        .send(Ok(parsed.file))
+                        .map_err(|_| "database writer stopped while parsing".to_string())?;
+                }
+                Err(err) => {
+                    let _ = sender.send(Err(err.clone()));
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+fn parse_one_input(
+    index: usize,
+    input: &ParseInput,
+    parser: &mut dyn Parser,
+) -> Result<ParsedOneFile, String> {
+    let loaded_source;
+    let source = match &input.source {
+        Some(source) => source,
+        None => {
+            loaded_source = read_source_lossy(&input.path)?;
+            &loaded_source
+        }
+    };
+    let symbols = parser
+        .parse_file(&input.path, &source.source)
+        .map_err(|e| format!("failed to parse {}: {e}", input.path.display()))?;
+    let symbols_checksum = crate::db_impl::file_symbols_checksum(&symbols);
+    Ok(ParsedOneFile {
+        file: StreamedFileSymbols {
+            index,
+            symbols,
+            checksum: source.checksum.clone(),
+            symbols_checksum,
+        },
+        bytes_read: source.bytes as u64,
+        decoded_lossy: source.decoded_lossy,
+    })
+}
+
 fn parse_worker(
     inputs: Arc<Vec<ParseInput>>,
     next_file: Arc<AtomicUsize>,
@@ -916,20 +1253,15 @@ fn parse_worker(
 
         for index in start..end {
             let input = &inputs[index];
-            let loaded_source;
-            let source = match &input.source {
-                Some(source) => source,
-                None => {
-                    loaded_source = read_source_lossy(&input.path)?;
-                    &loaded_source
-                }
-            };
-            parsed.bytes_read += source.bytes as u64;
-            parsed.lossy_decoded_files += usize::from(source.decoded_lossy);
-            let symbols = parser
-                .parse_file(&input.path, &source.source)
-                .map_err(|e| format!("failed to parse {}: {e}", input.path.display()))?;
-            parsed.files.push(ParsedFile { index, symbols });
+            let parsed_file = parse_one_input(index, input, &mut *parser)?;
+            parsed.bytes_read += parsed_file.bytes_read;
+            parsed.lossy_decoded_files += usize::from(parsed_file.decoded_lossy);
+            parsed.files.push(ParsedFile {
+                index,
+                symbols: parsed_file.file.symbols,
+                checksum: parsed_file.file.checksum,
+                symbols_checksum: parsed_file.file.symbols_checksum,
+            });
         }
     }
 
@@ -972,15 +1304,17 @@ fn is_supported_extension(path: &Path, extensions: &[&str]) -> bool {
 fn read_source_lossy(path: &std::path::Path) -> Result<SourceFile, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    Ok(decode_source_lossy(path, bytes))
+    let checksum = crate::db_impl::checksum_bytes(&bytes);
+    Ok(decode_source_lossy(path, bytes, checksum))
 }
 
-fn decode_source_lossy(path: &std::path::Path, bytes: Vec<u8>) -> SourceFile {
+fn decode_source_lossy(path: &std::path::Path, bytes: Vec<u8>, checksum: String) -> SourceFile {
     let byte_len = bytes.len();
     match String::from_utf8(bytes) {
         Ok(source) => SourceFile {
             source,
             bytes: byte_len,
+            checksum,
             decoded_lossy: false,
         },
         Err(err) => {
@@ -991,6 +1325,7 @@ fn decode_source_lossy(path: &std::path::Path, bytes: Vec<u8>) -> SourceFile {
             SourceFile {
                 source: String::from_utf8_lossy(&err.into_bytes()).into_owned(),
                 bytes: byte_len,
+                checksum,
                 decoded_lossy: true,
             }
         }

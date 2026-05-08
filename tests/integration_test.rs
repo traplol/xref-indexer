@@ -277,6 +277,12 @@ fn test_call_graph_uses_function_callers_and_keeps_call_references() {
 
 #[test]
 fn test_reference_modes_control_reference_volume() {
+    let default_refs = Indexer::builder()
+        .add_directory(fixtures_dir())
+        .language(Language::Cpp)
+        .build()
+        .index()
+        .expect("default indexing should succeed");
     let calls_only = Indexer::builder()
         .add_directory(fixtures_dir())
         .language(Language::Cpp)
@@ -293,6 +299,11 @@ fn test_reference_modes_control_reference_volume() {
         .expect("no-ref indexing should succeed");
     let all_refs = fixture_index();
 
+    assert_eq!(
+        default_refs.reference_count(),
+        0,
+        "default mode should suppress refs"
+    );
     assert!(
         calls_only.reference_count() > 0,
         "calls mode should keep call-site refs"
@@ -315,6 +326,11 @@ fn test_reference_modes_control_reference_volume() {
         calls_only.calls().len(),
         no_refs.calls().len(),
         "none mode should still collect call graph edges"
+    );
+    assert_eq!(
+        default_refs.calls().len(),
+        no_refs.calls().len(),
+        "default mode should still collect call graph edges"
     );
 }
 

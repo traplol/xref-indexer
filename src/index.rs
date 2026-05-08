@@ -256,10 +256,17 @@ impl IndexBuilder {
         }
     }
 
-    pub fn add_file(&mut self, symbols: FileSymbols) {
+    pub(crate) fn add_file_with_checksums(
+        &mut self,
+        symbols: FileSymbols,
+        checksum: Option<String>,
+        symbols_checksum: Option<String>,
+    ) {
         self.files.push(IndexedFile {
             path: symbols.file,
             language: symbols.language,
+            checksum,
+            symbols_checksum,
         });
         self.definitions.extend(symbols.definitions);
         self.references.extend(symbols.references);

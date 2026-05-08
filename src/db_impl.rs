@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
 use rusqlite::{params, Connection};
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Serialize;
 
 use crate::index::Index;
 use crate::types::*;
@@ -19,6 +23,60 @@ pub struct IncrementalChecksumUpdate<'a> {
     pub path: &'a Path,
     pub checksum: &'a str,
     pub symbols_checksum: &'a str,
+}
+
+pub struct StreamedFileSymbols {
+    pub index: usize,
+    pub symbols: FileSymbols,
+    pub checksum: String,
+    pub symbols_checksum: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StreamedDbWriteMetrics {
+    pub setup_ms: u128,
+    pub streamed_files_and_definitions_ms: u128,
+    pub pending_edges_ms: u128,
+    pub commit_ms: u128,
+    pub create_indexes_ms: u128,
+    pub finalize_ms: u128,
+    pub total_ms: u128,
+}
+
+struct PendingReference {
+    name: String,
+    kind: SymbolKind,
+    file_id: i64,
+    line: usize,
+    column: usize,
+    context: Option<String>,
+}
+
+struct PendingCall {
+    caller_name: String,
+    callee_name: String,
+    file_id: i64,
+    line: usize,
+    column: usize,
+}
+
+struct PendingInherit {
+    derived_name: String,
+    base_name: String,
+    file_id: i64,
+    access: Visibility,
+    is_virtual: bool,
+}
+
+#[derive(Default)]
+struct StreamInsertState {
+    next_def_id: i64,
+    metrics: IncrementalDbUpdate,
+    qname_to_db_id: FxHashMap<String, i64>,
+    name_to_db_id: FxHashMap<String, Option<i64>>,
+    pending_refs: Vec<PendingReference>,
+    pending_calls: Vec<PendingCall>,
+    pending_inherits: Vec<PendingInherit>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +175,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             path TEXT NOT NULL UNIQUE,
             language TEXT NOT NULL,
             follow_symlinks INTEGER NOT NULL DEFAULT 0,
-            reference_mode TEXT NOT NULL DEFAULT 'calls',
+            reference_mode TEXT NOT NULL DEFAULT 'none',
             include_reference_context INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -411,8 +469,18 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
         "DELETE FROM inheritance; DELETE FROM call_graph; DELETE FROM refs; DELETE FROM definitions; DELETE FROM files; DELETE FROM index_roots;",
     )?;
 
-    // Insert files from the index's first-class file collection.
-    let symbol_checksums = index_symbol_checksums(index);
+    // Insert files from the index's first-class file collection. New indexes
+    // carry checksums from the parallel parse stage; fall back for older
+    // programmatic Index::new callers.
+    let symbol_checksums = if index
+        .files()
+        .iter()
+        .any(|file| file.symbols_checksum.is_none())
+    {
+        index_symbol_checksums(index)
+    } else {
+        FxHashMap::default()
+    };
     let mut file_ids: FxHashMap<PathBuf, i64> = FxHashMap::default();
     file_ids.reserve(index.files().len());
     {
@@ -422,8 +490,14 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
         for (i, f) in index.files().iter().enumerate() {
             let db_id = i as i64 + 1;
             let path_str = f.path.to_str().unwrap_or("");
-            let checksum = checksum_path(&f.path).ok().map(|(checksum, _)| checksum);
-            let symbols_checksum = symbol_checksums.get(&f.path);
+            let checksum = f
+                .checksum
+                .clone()
+                .or_else(|| checksum_path(&f.path).ok().map(|(checksum, _)| checksum));
+            let symbols_checksum = f
+                .symbols_checksum
+                .as_ref()
+                .or_else(|| symbol_checksums.get(&f.path));
             insert_stmt.execute(params![
                 db_id,
                 path_str,
@@ -556,6 +630,131 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
         ",
     )?;
     Ok(conn)
+}
+
+pub fn save_streamed_to_db(
+    path: &Path,
+    receiver: Receiver<Result<StreamedFileSymbols, String>>,
+) -> Result<(Connection, IncrementalDbUpdate, StreamedDbWriteMetrics), String> {
+    let writer_start = Instant::now();
+    let conn = Connection::open(path)
+        .map_err(|e| format!("failed to open database '{}': {e}", path.display()))?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode=OFF;
+        PRAGMA synchronous=OFF;
+        PRAGMA foreign_keys=OFF;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA locking_mode=EXCLUSIVE;
+        PRAGMA cache_size=-200000;
+        ",
+    )
+    .map_err(|e| format!("failed to configure database '{}': {e}", path.display()))?;
+    create_tables(&conn).map_err(|e| format!("failed to prepare database tables: {e}"))?;
+    drop_indexes(&conn).map_err(|e| format!("failed to drop database indexes: {e}"))?;
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("failed to start database transaction: {e}"))?;
+    tx.execute_batch(
+        "DELETE FROM inheritance; DELETE FROM call_graph; DELETE FROM refs; DELETE FROM definitions; DELETE FROM files; DELETE FROM index_roots;",
+    )
+    .map_err(|e| format!("failed to clear database: {e}"))?;
+    let setup_ms = writer_start.elapsed().as_millis();
+
+    let mut state = StreamInsertState {
+        next_def_id: 1,
+        ..StreamInsertState::default()
+    };
+
+    let streamed_start = Instant::now();
+    {
+        let mut insert_file_stmt = tx
+            .prepare(
+                "
+                INSERT INTO files (id, path, language, checksum, symbols_checksum, indexed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+                ",
+            )
+            .map_err(|e| format!("failed to prepare file insert: {e}"))?;
+        let mut insert_def_stmt = tx
+            .prepare(
+                "
+                INSERT INTO definitions (
+                    id, name, qualified_name, kind, file_id, line, column,
+                    end_line, end_column, parent_name, signature, visibility,
+                    is_definition, extra
+                )
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                ",
+            )
+            .map_err(|e| format!("failed to prepare definition insert: {e}"))?;
+
+        let mut next_index = 0usize;
+        let mut pending: BTreeMap<usize, StreamedFileSymbols> = BTreeMap::new();
+
+        while let Ok(message) = receiver.recv() {
+            let file = message?;
+            pending.insert(file.index, file);
+            while let Some(file) = pending.remove(&next_index) {
+                insert_streamed_file_symbols(
+                    &mut insert_file_stmt,
+                    &mut insert_def_stmt,
+                    &mut state,
+                    file,
+                )
+                .map_err(|e| format!("failed to insert parsed file {next_index}: {e}"))?;
+                next_index += 1;
+            }
+        }
+
+        if !pending.is_empty() {
+            return Err(format!(
+                "parser stream ended before file index {next_index}; {} parsed files are pending",
+                pending.len()
+            ));
+        }
+    }
+    let streamed_files_and_definitions_ms = streamed_start.elapsed().as_millis();
+
+    let pending_edges_start = Instant::now();
+    insert_streamed_pending_edges(&tx, &mut state)
+        .map_err(|e| format!("failed to insert resolved references: {e}"))?;
+    let pending_edges_ms = pending_edges_start.elapsed().as_millis();
+
+    let commit_start = Instant::now();
+    tx.commit()
+        .map_err(|e| format!("failed to commit database transaction: {e}"))?;
+    let commit_ms = commit_start.elapsed().as_millis();
+
+    let create_indexes_start = Instant::now();
+    create_indexes(&conn).map_err(|e| format!("failed to create database indexes: {e}"))?;
+    let create_indexes_ms = create_indexes_start.elapsed().as_millis();
+
+    let finalize_start = Instant::now();
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys=ON;
+        PRAGMA locking_mode=NORMAL;
+        PRAGMA optimize;
+        ",
+    )
+    .map_err(|e| format!("failed to finalize database: {e}"))?;
+    let finalize_ms = finalize_start.elapsed().as_millis();
+
+    Ok((
+        conn,
+        state.metrics,
+        StreamedDbWriteMetrics {
+            setup_ms,
+            streamed_files_and_definitions_ms,
+            pending_edges_ms,
+            commit_ms,
+            create_indexes_ms,
+            finalize_ms,
+            total_ms: writer_start.elapsed().as_millis(),
+        },
+    ))
 }
 
 pub fn apply_incremental_update(
@@ -716,7 +915,7 @@ pub fn load_index_config(conn: &Connection) -> rusqlite::Result<Option<IndexConf
         roots,
         language: language.unwrap_or_else(|| "cpp".to_string()),
         follow_symlinks,
-        reference_mode: reference_mode.unwrap_or_else(|| "calls".to_string()),
+        reference_mode: reference_mode.unwrap_or_else(|| "none".to_string()),
         include_reference_context,
     }))
 }
@@ -921,6 +1120,172 @@ fn insert_file_symbols(
     metrics.inheritance_inserted += symbols.inherits.len();
 
     Ok(())
+}
+
+fn insert_streamed_file_symbols(
+    insert_file_stmt: &mut rusqlite::Statement<'_>,
+    insert_def_stmt: &mut rusqlite::Statement<'_>,
+    state: &mut StreamInsertState,
+    file: StreamedFileSymbols,
+) -> rusqlite::Result<()> {
+    let file_id = file.index as i64 + 1;
+    let path_str = file.symbols.file.to_string_lossy();
+    insert_file_stmt.execute(params![
+        file_id,
+        path_str.as_ref(),
+        file.symbols.language.as_str(),
+        file.checksum.as_str(),
+        file.symbols_checksum.as_str(),
+    ])?;
+
+    let FileSymbols {
+        file: _,
+        language: _,
+        definitions,
+        references,
+        calls,
+        inherits,
+    } = file.symbols;
+
+    for d in definitions {
+        let def_id = state.next_def_id;
+        state.next_def_id += 1;
+        let name_key = d.name.clone();
+        let qname_key = d.qualified_name.clone();
+        insert_def_stmt.execute(params![
+            def_id,
+            d.name,
+            d.qualified_name,
+            d.kind.as_str(),
+            file_id,
+            d.location.line as i64,
+            d.location.column as i64,
+            d.location.end_line as i64,
+            d.location.end_column as i64,
+            d.parent.as_ref(),
+            d.signature,
+            d.visibility.as_str(),
+            d.is_definition as i64,
+            d.extra,
+        ])?;
+        state.qname_to_db_id.insert(qname_key, def_id);
+        state
+            .name_to_db_id
+            .entry(name_key)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(def_id));
+        state.metrics.definitions_inserted += 1;
+    }
+
+    state.pending_refs.reserve(references.len());
+    for r in references {
+        state.pending_refs.push(PendingReference {
+            name: r.name,
+            kind: r.kind,
+            file_id,
+            line: r.location.line,
+            column: r.location.column,
+            context: r.context,
+        });
+    }
+
+    state.pending_calls.reserve(calls.len());
+    for call in calls {
+        state.pending_calls.push(PendingCall {
+            caller_name: call.caller_name,
+            callee_name: call.callee_name,
+            file_id,
+            line: call.location.line,
+            column: call.location.column,
+        });
+    }
+
+    state.pending_inherits.reserve(inherits.len());
+    for inherit in inherits {
+        state.pending_inherits.push(PendingInherit {
+            derived_name: inherit.derived_name,
+            base_name: inherit.base_name,
+            file_id,
+            access: inherit.access,
+            is_virtual: inherit.is_virtual,
+        });
+    }
+
+    Ok(())
+}
+
+fn insert_streamed_pending_edges(
+    tx: &rusqlite::Transaction<'_>,
+    state: &mut StreamInsertState,
+) -> rusqlite::Result<()> {
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO refs (name, kind, file_id, line, column, def_id, context) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )?;
+        for reference in &state.pending_refs {
+            let def_id = resolve_streamed_db_definition_id(state, &reference.name);
+            stmt.execute(params![
+                reference.name,
+                reference.kind.as_str(),
+                reference.file_id,
+                reference.line as i64,
+                reference.column as i64,
+                def_id,
+                reference.context,
+            ])?;
+        }
+    }
+    state.metrics.references_inserted += state.pending_refs.len();
+
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO call_graph (caller_id, callee_id, caller_name, callee_name, file_id, line, column) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )?;
+        for call in &state.pending_calls {
+            let caller_id = resolve_streamed_db_definition_id(state, &call.caller_name);
+            let callee_id = resolve_streamed_db_definition_id(state, &call.callee_name);
+            stmt.execute(params![
+                caller_id,
+                callee_id,
+                call.caller_name,
+                call.callee_name,
+                call.file_id,
+                call.line as i64,
+                call.column as i64,
+            ])?;
+        }
+    }
+    state.metrics.calls_inserted += state.pending_calls.len();
+
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO inheritance (derived_id, base_id, file_id, derived_name, base_name, access, is_virtual) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )?;
+        for inherit in &state.pending_inherits {
+            let derived_id = resolve_streamed_db_definition_id(state, &inherit.derived_name);
+            let base_id = resolve_streamed_db_definition_id(state, &inherit.base_name);
+            stmt.execute(params![
+                derived_id,
+                base_id,
+                inherit.file_id,
+                inherit.derived_name,
+                inherit.base_name,
+                inherit.access.as_str(),
+                inherit.is_virtual as i64,
+            ])?;
+        }
+    }
+    state.metrics.inheritance_inserted += state.pending_inherits.len();
+
+    Ok(())
+}
+
+fn resolve_streamed_db_definition_id(state: &StreamInsertState, name: &str) -> Option<i64> {
+    state
+        .qname_to_db_id
+        .get(name)
+        .copied()
+        .or_else(|| state.name_to_db_id.get(name).and_then(|id| *id))
 }
 
 fn definition_names(symbols: &FileSymbols) -> FxHashSet<String> {
@@ -1131,11 +1496,14 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
     };
 
     let index_files: Vec<IndexedFile> = {
-        let mut stmt = conn.prepare("SELECT path, language FROM files")?;
+        let mut stmt =
+            conn.prepare("SELECT path, language, checksum, symbols_checksum FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok(IndexedFile {
                 path: std::path::PathBuf::from(row.get::<_, String>(0)?),
                 language: row.get(1)?,
+                checksum: row.get(2)?,
+                symbols_checksum: row.get(3)?,
             })
         })?;
         let mut files = Vec::new();

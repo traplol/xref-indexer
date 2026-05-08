@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::{IndexMetrics, Indexer, Language, ReferenceMode};
+use crate::{IndexMetrics, Indexer, Language, ReferenceMode, StreamedDbWriteMetrics};
 
 /// Configuration for a benchmarked indexing run.
 #[derive(Debug, Clone)]
@@ -24,7 +24,7 @@ impl Default for BenchmarkConfig {
             language: Language::Cpp,
             follow_symlinks: false,
             threads: None,
-            reference_mode: ReferenceMode::Calls,
+            reference_mode: ReferenceMode::None,
             include_reference_context: false,
             db_path: None,
         }
@@ -36,6 +36,7 @@ impl Default for BenchmarkConfig {
 pub struct SaveMetrics {
     pub db: String,
     pub save_ms: u128,
+    pub writer: Option<StreamedDbWriteMetrics>,
     pub db_bytes: Option<u64>,
 }
 
@@ -72,38 +73,28 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport, String> {
         builder = builder.add_directory(root);
     }
 
-    let run = builder
-        .build()
-        .index_with_metrics()
-        .map_err(|e| format!("benchmark index failed: {e}"))?;
-
-    let save = if let Some(db_path) = &config.db_path {
-        let save_start = Instant::now();
-        let conn = run
-            .index
-            .save_to_db(db_path)
-            .map_err(|e| format!("benchmark save failed for '{}': {e}", db_path.display()))?;
-        crate::db_impl::save_index_config(
-            &conn,
-            &config.roots,
-            language_name(config.language),
-            config.follow_symlinks,
-            reference_mode_name(config.reference_mode),
-            config.include_reference_context,
-        )
-        .map_err(|e| {
+    let (index_metrics, save) = if let Some(db_path) = &config.db_path {
+        let run = builder.build().index_db(db_path).map_err(|e| {
             format!(
-                "benchmark save roots failed for '{}': {e}",
+                "benchmark streamed index failed for '{}': {e}",
                 db_path.display()
             )
         })?;
-        Some(SaveMetrics {
-            db: db_path.to_string_lossy().to_string(),
-            save_ms: save_start.elapsed().as_millis(),
-            db_bytes: std::fs::metadata(db_path).ok().map(|meta| meta.len()),
-        })
+        (
+            run.metrics,
+            Some(SaveMetrics {
+                db: db_path.to_string_lossy().to_string(),
+                save_ms: run.save_ms,
+                writer: Some(run.writer),
+                db_bytes: std::fs::metadata(db_path).ok().map(|meta| meta.len()),
+            }),
+        )
     } else {
-        None
+        let run = builder
+            .build()
+            .index_with_metrics()
+            .map_err(|e| format!("benchmark index failed: {e}"))?;
+        (run.metrics, None)
     };
 
     Ok(BenchmarkReport {
@@ -116,7 +107,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport, String> {
         follow_symlinks: config.follow_symlinks,
         reference_mode: config.reference_mode,
         include_reference_context: config.include_reference_context,
-        index: run.metrics,
+        index: index_metrics,
         save,
         total_ms: total_start.elapsed().as_millis(),
     })
@@ -126,13 +117,5 @@ fn language_name(language: Language) -> &'static str {
     match language {
         Language::C => "c",
         Language::Cpp => "cpp",
-    }
-}
-
-fn reference_mode_name(reference_mode: ReferenceMode) -> &'static str {
-    match reference_mode {
-        ReferenceMode::None => "none",
-        ReferenceMode::Calls => "calls",
-        ReferenceMode::All => "all",
     }
 }

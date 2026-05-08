@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Instant;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
@@ -9,7 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use xref_indexer::benchmark::{self, BenchmarkConfig};
 use xref_indexer::types::{CallEdge, Definition, Location, SymbolKind, Visibility};
-use xref_indexer::{Index, Indexer, Language, ReferenceMode};
+use xref_indexer::{Indexer, Language, ReferenceMode};
 
 const DEFAULT_DB_PATH: &str = ".git/code-indexer/xrefs.sqlite3";
 
@@ -197,7 +196,7 @@ impl ParsedArgs {
         parse_reference_mode(
             self.value("references")
                 .or_else(|| self.value("reference-mode"))
-                .unwrap_or("calls"),
+                .unwrap_or("none"),
         )
     }
 }
@@ -234,28 +233,12 @@ fn cmd_index(args: &ParsedArgs) -> Result<Value, String> {
         builder = builder.add_directory(root);
     }
 
-    let run = builder
-        .build()
-        .index_with_metrics()
-        .map_err(|e| format!("index failed: {e}"))?;
     let db = args.db_path();
     ensure_db_parent(db)?;
-    let save_start = Instant::now();
-    let conn = run
-        .index
-        .save_to_db(db)
-        .map_err(|e| format!("failed to save database '{db}': {e}"))?;
-    xref_indexer::db::save_index_config(
-        &conn,
-        &roots,
-        language_name(language),
-        args.bool_flag("follow-symlinks"),
-        reference_mode_name(args.reference_mode()?),
-        args.bool_flag("reference-context"),
-    )
-    .map_err(|e| format!("failed to save index roots: {e}"))?;
-    let save_ms = save_start.elapsed().as_millis();
-    let index_ms = run.metrics.total_ms;
+    let run = builder
+        .build()
+        .index_db(db)
+        .map_err(|e| format!("index failed: {e}"))?;
 
     Ok(json!({
         "ok": true,
@@ -263,10 +246,11 @@ fn cmd_index(args: &ParsedArgs) -> Result<Value, String> {
         "db": db,
         "roots": roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         "language": language_name(language),
-        "summary": index_summary(&run.index),
+        "summary": run.summary,
         "metrics": run.metrics,
-        "save_ms": save_ms,
-        "total_ms": index_ms + save_ms,
+        "save_ms": run.save_ms,
+        "writer": run.writer,
+        "total_ms": run.total_ms,
     }))
 }
 
@@ -540,6 +524,7 @@ fn cmd_search(args: &ParsedArgs) -> Result<Value, String> {
         "query": query,
         "result_count": results.len(),
         "results": results,
+        "notes": ["Default indexes do not populate refs; rebuild with --references calls or --references all for refs results"]
     }))
 }
 
@@ -1357,24 +1342,6 @@ fn parse_reference_mode(value: &str) -> Result<ReferenceMode, String> {
     }
 }
 
-fn reference_mode_name(reference_mode: ReferenceMode) -> &'static str {
-    match reference_mode {
-        ReferenceMode::None => "none",
-        ReferenceMode::Calls => "calls",
-        ReferenceMode::All => "all",
-    }
-}
-
-fn index_summary(index: &Index) -> Value {
-    json!({
-        "files": index.files().len(),
-        "definitions": index.definition_count(),
-        "references": index.reference_count(),
-        "calls": index.calls().len(),
-        "inheritance_edges": index.inherits().len(),
-    })
-}
-
 fn owned_definition_hits_with_confidence(
     defs: &[Definition],
     confidence: &str,
@@ -1603,7 +1570,9 @@ Notes:
   - DB-backed queries run an incremental reindex check first using saved roots.
   - Pass --no-reindex to query the current DB without checking the filesystem.
   - bench is no-save by default unless --db or --save is provided.
-  - Default references mode is calls; use --references all for exhaustive identifier refs.
+  - Default references mode is none; call_graph is still collected.
+  - Use --references calls for call-site refs or --references all for exhaustive identifier refs.
+  - refs requires a DB built with --references calls or --references all.
   - Per-reference source context is disabled during indexing unless --reference-context is set.
   - Exact qualified/simple matches are higher confidence than substring matches.
   - Use context/snippet output instead of separate sed -n calls.
