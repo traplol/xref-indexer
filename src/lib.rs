@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -380,9 +381,21 @@ fn index_paths(
 #[derive(Clone)]
 struct FileSnapshot {
     path: PathBuf,
-    language: String,
     checksum: String,
     bytes: u64,
+}
+
+struct ScannedFile {
+    snapshot: FileSnapshot,
+    change: FileChange,
+    source: Option<SourceFile>,
+}
+
+#[derive(Clone, Copy)]
+enum FileChange {
+    Unchanged,
+    Modified,
+    New,
 }
 
 struct DbFileRecord {
@@ -405,11 +418,7 @@ fn reindex_paths_to_db(
     let files = discover_files(&paths, language, follow_symlinks)?;
     let discover_ms = discover_start.elapsed().as_millis();
     let files_discovered = files.len();
-
-    let checksum_start = Instant::now();
-    let snapshots = checksum_files(files, language)?;
-    let checksum_ms = checksum_start.elapsed().as_millis();
-    let bytes_scanned = snapshots.iter().map(|file| file.bytes).sum();
+    let reindex_worker_count = worker_count(threads, files_discovered);
 
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -438,7 +447,16 @@ fn reindex_paths_to_db(
 
     let db_records = load_db_file_records(&conn)
         .map_err(|e| format!("failed to load database file records: {e}"))?;
-    let current_paths: HashSet<PathBuf> = snapshots.iter().map(|file| file.path.clone()).collect();
+
+    let checksum_start = Instant::now();
+    let scanned_files = checksum_files(files, language, &db_records, reindex_worker_count)?;
+    let checksum_ms = checksum_start.elapsed().as_millis();
+    let bytes_scanned = scanned_files.iter().map(|file| file.snapshot.bytes).sum();
+
+    let current_paths: HashSet<PathBuf> = scanned_files
+        .iter()
+        .map(|file| file.snapshot.path.clone())
+        .collect();
     let removed_paths: Vec<PathBuf> = db_records
         .keys()
         .filter(|path| !current_paths.contains(*path))
@@ -447,27 +465,33 @@ fn reindex_paths_to_db(
 
     let mut files_new = 0;
     let mut files_modified = 0;
+    let mut checksums: HashMap<PathBuf, String> = HashMap::with_capacity(scanned_files.len());
     let mut to_parse = Vec::new();
-    for snapshot in &snapshots {
-        match db_records.get(&snapshot.path) {
-            Some(record)
-                if record.checksum.as_deref() == Some(snapshot.checksum.as_str())
-                    && record.language == snapshot.language => {}
-            Some(_) => {
+    for scanned_file in scanned_files {
+        let ScannedFile {
+            snapshot,
+            change,
+            source,
+        } = scanned_file;
+        let path = snapshot.path;
+        checksums.insert(path.clone(), snapshot.checksum);
+        match change {
+            FileChange::Unchanged => {}
+            FileChange::Modified => {
                 files_modified += 1;
-                to_parse.push(snapshot.clone());
+                to_parse.push(ParseInput { path, source });
             }
-            None => {
+            FileChange::New => {
                 files_new += 1;
-                to_parse.push(snapshot.clone());
+                to_parse.push(ParseInput { path, source });
             }
         }
     }
 
     let worker_count = worker_count(threads, to_parse.len());
     let parse_start = Instant::now();
-    let parsed = parse_files(
-        to_parse.iter().map(|file| file.path.clone()).collect(),
+    let parsed = parse_file_inputs(
+        to_parse,
         language,
         worker_count,
         reference_mode,
@@ -491,10 +515,6 @@ fn reindex_paths_to_db(
     let calls = parsed.files.iter().map(|f| f.symbols.calls.len()).sum();
     let inheritance_edges = parsed.files.iter().map(|f| f.symbols.inherits.len()).sum();
 
-    let checksums: HashMap<PathBuf, String> = snapshots
-        .iter()
-        .map(|file| (file.path.clone(), file.checksum.clone()))
-        .collect();
     let mut checksum_only_updates = Vec::new();
     let mut symbols_checksums: HashMap<PathBuf, String> = HashMap::new();
     for file in &parsed.files {
@@ -564,7 +584,7 @@ fn reindex_paths_to_db(
         db_counts(&conn).map_err(|e| format!("failed to read database counts: {e}"))?;
 
     let metrics = IncrementalMetrics {
-        threads: worker_count,
+        threads: reindex_worker_count,
         files_discovered,
         files_unchanged: files_discovered.saturating_sub(files_new + files_modified),
         files_new,
@@ -605,21 +625,65 @@ fn reindex_paths_to_db(
     Ok(IncrementalRun { metrics })
 }
 
-fn checksum_files(files: Vec<PathBuf>, language: Language) -> Result<Vec<FileSnapshot>, String> {
+fn checksum_files(
+    files: Vec<PathBuf>,
+    language: Language,
+    db_records: &HashMap<PathBuf, DbFileRecord>,
+    threads: usize,
+) -> Result<Vec<ScannedFile>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|worker_id| format!("xref-indexer-checksum-{worker_id}"))
+        .stack_size(INDEXER_STACK_SIZE)
+        .build()
+        .map_err(|e| format!("failed to start checksum worker pool: {e}"))?;
     let language = language_name(language).to_string();
-    files
-        .into_iter()
-        .map(|path| {
-            let (checksum, bytes) = crate::db_impl::checksum_path(&path)
-                .map_err(|e| format!("failed to checksum {}: {e}", path.display()))?;
-            Ok(FileSnapshot {
-                path,
-                language: language.clone(),
-                checksum,
-                bytes,
-            })
-        })
-        .collect()
+
+    pool.install(|| {
+        files
+            .into_par_iter()
+            .map(|path| checksum_file(path, &language, db_records))
+            .collect()
+    })
+}
+
+fn checksum_file(
+    path: PathBuf,
+    language: &str,
+    db_records: &HashMap<PathBuf, DbFileRecord>,
+) -> Result<ScannedFile, String> {
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("failed to checksum {}: {e}", path.display()))?;
+    let byte_len = bytes.len() as u64;
+    let checksum = crate::db_impl::checksum_bytes(&bytes);
+    let change = match db_records.get(&path) {
+        Some(record)
+            if record.checksum.as_deref() == Some(checksum.as_str())
+                && record.language == language =>
+        {
+            FileChange::Unchanged
+        }
+        Some(_) => FileChange::Modified,
+        None => FileChange::New,
+    };
+    let source = match change {
+        FileChange::Unchanged => None,
+        FileChange::Modified | FileChange::New => Some(decode_source_lossy(&path, bytes)),
+    };
+
+    Ok(ScannedFile {
+        snapshot: FileSnapshot {
+            path,
+            checksum,
+            bytes: byte_len,
+        },
+        change,
+        source,
+    })
 }
 
 fn load_db_file_records(
@@ -737,6 +801,11 @@ struct ParsedFile {
     symbols: crate::types::FileSymbols,
 }
 
+struct ParseInput {
+    path: PathBuf,
+    source: Option<SourceFile>,
+}
+
 struct SourceFile {
     source: String,
     bytes: usize,
@@ -750,7 +819,26 @@ fn parse_files(
     reference_mode: ReferenceMode,
     include_reference_context: bool,
 ) -> Result<ParsedFiles, String> {
-    if files.is_empty() {
+    parse_file_inputs(
+        files
+            .into_iter()
+            .map(|path| ParseInput { path, source: None })
+            .collect(),
+        language,
+        threads,
+        reference_mode,
+        include_reference_context,
+    )
+}
+
+fn parse_file_inputs(
+    inputs: Vec<ParseInput>,
+    language: Language,
+    threads: usize,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+) -> Result<ParsedFiles, String> {
+    if inputs.is_empty() {
         return Ok(ParsedFiles::default());
     }
 
@@ -761,19 +849,19 @@ fn parse_files(
         .build()
         .map_err(|e| format!("failed to start parser worker pool: {e}"))?;
 
-    let files = Arc::new(files);
+    let inputs = Arc::new(inputs);
     let next_file = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::channel();
 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pool.scope(|scope| {
             for _ in 0..threads {
-                let files = Arc::clone(&files);
+                let inputs = Arc::clone(&inputs);
                 let next_file = Arc::clone(&next_file);
                 let sender = sender.clone();
                 scope.spawn(move |_| {
                     let result = parse_worker(
-                        files,
+                        inputs,
                         next_file,
                         language,
                         reference_mode,
@@ -810,7 +898,7 @@ fn parse_files(
 }
 
 fn parse_worker(
-    files: Arc<Vec<PathBuf>>,
+    inputs: Arc<Vec<ParseInput>>,
     next_file: Arc<AtomicUsize>,
     language: Language,
     reference_mode: ReferenceMode,
@@ -821,19 +909,26 @@ fn parse_worker(
 
     loop {
         let start = next_file.fetch_add(PARSE_CHUNK_SIZE, Ordering::Relaxed);
-        if start >= files.len() {
+        if start >= inputs.len() {
             break;
         }
-        let end = (start + PARSE_CHUNK_SIZE).min(files.len());
+        let end = (start + PARSE_CHUNK_SIZE).min(inputs.len());
 
         for index in start..end {
-            let path = &files[index];
-            let source = read_source_lossy(path)?;
+            let input = &inputs[index];
+            let loaded_source;
+            let source = match &input.source {
+                Some(source) => source,
+                None => {
+                    loaded_source = read_source_lossy(&input.path)?;
+                    &loaded_source
+                }
+            };
             parsed.bytes_read += source.bytes as u64;
             parsed.lossy_decoded_files += usize::from(source.decoded_lossy);
             let symbols = parser
-                .parse_file(path, &source.source)
-                .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+                .parse_file(&input.path, &source.source)
+                .map_err(|e| format!("failed to parse {}: {e}", input.path.display()))?;
             parsed.files.push(ParsedFile { index, symbols });
         }
     }
@@ -877,23 +972,27 @@ fn is_supported_extension(path: &Path, extensions: &[&str]) -> bool {
 fn read_source_lossy(path: &std::path::Path) -> Result<SourceFile, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    Ok(decode_source_lossy(path, bytes))
+}
+
+fn decode_source_lossy(path: &std::path::Path, bytes: Vec<u8>) -> SourceFile {
     let byte_len = bytes.len();
     match String::from_utf8(bytes) {
-        Ok(source) => Ok(SourceFile {
+        Ok(source) => SourceFile {
             source,
             bytes: byte_len,
             decoded_lossy: false,
-        }),
+        },
         Err(err) => {
             eprintln!(
                 "Warning: decoded {} with replacement characters because it is not valid UTF-8",
                 path.display()
             );
-            Ok(SourceFile {
-                source: String::from_utf8_lossy(err.as_bytes()).into_owned(),
+            SourceFile {
+                source: String::from_utf8_lossy(&err.into_bytes()).into_owned(),
                 bytes: byte_len,
                 decoded_lossy: true,
-            })
+            }
         }
     }
 }
