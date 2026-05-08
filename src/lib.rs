@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod cli;
 mod cpp_parser;
 mod index;
 mod parser;

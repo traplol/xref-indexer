@@ -1,8 +1,8 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use xref_indexer::benchmark::{self, BenchmarkConfig};
 use xref_indexer::types::{SymbolKind, Visibility};
 use xref_indexer::{Indexer, Language, ReferenceMode};
@@ -42,6 +42,43 @@ fn run_cli_json(args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("CLI should emit JSON")
+}
+
+fn run_mcp_json(messages: &[Value]) -> Vec<Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xref-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn xref-mcp");
+
+    {
+        let stdin = child.stdin.as_mut().expect("mcp stdin");
+        for message in messages {
+            writeln!(stdin, "{message}").expect("write mcp request");
+        }
+    }
+    drop(child.stdin.take());
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .as_mut()
+        .expect("mcp stdout")
+        .read_to_string(&mut stdout)
+        .expect("read mcp stdout");
+    let output = child.wait_with_output().expect("wait for xref-mcp");
+    assert!(
+        output.status.success(),
+        "MCP failed with status {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("MCP should emit JSON-RPC lines"))
+        .collect()
 }
 
 #[test]
@@ -714,6 +751,76 @@ fn test_cli_query_infers_roots_for_legacy_db_without_saved_roots() {
 
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_mcp_lists_tools_and_calls_find() {
+    let db_path = unique_db_path("xref-indexer-mcp-db");
+    let root = fixtures_dir();
+    let root_arg = root.to_string_lossy().to_string();
+    let db_arg = db_path.to_string_lossy().to_string();
+    let indexed = run_cli_json(&["index", "--root", &root_arg, "--db", &db_arg]);
+    assert_eq!(indexed["ok"], true);
+
+    let responses = run_mcp_json(&[
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "xref-indexer-test", "version": "0" }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "xref_find",
+                "arguments": {
+                    "db": db_arg,
+                    "symbol": "demo::Derived::run",
+                    "limit": 3,
+                    "snippets": false,
+                    "no_reindex": true
+                }
+            }
+        }),
+    ]);
+
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[2]["id"], 3);
+
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(tools.iter().any(|tool| tool["name"] == "xref_find"));
+
+    let result = &responses[2]["result"];
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"]["ok"], true);
+    assert_eq!(result["structuredContent"]["result_count"], 1);
+    assert_eq!(
+        result["structuredContent"]["results"][0]["definition"]["qualified_name"],
+        "demo::Derived::run"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
 }
 
 #[test]

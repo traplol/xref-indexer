@@ -69,6 +69,42 @@ The CLI reports confidence/provenance-style fields such as `exact_qualified`, `e
 
 The default reference mode is `--references none`, which stores definitions, call graph edges, and class inheritance without duplicating call sites in `refs`. Use `--references calls` when the `refs` command should return call-site references, or `--references all` for exhaustive identifier refs. Per-reference source-line context is disabled by default; use `context`/snippets for lazy source text, or pass `--reference-context` for the heavier legacy behavior.
 
+## MCP server
+
+The `xref-mcp` binary exposes the same LLM-first lookup flow as a stdio MCP server. It uses the same default database location, `./.git/code-indexer/xrefs.sqlite3`, and query tools run the same auto-reindex check as the CLI unless `no_reindex` is set.
+
+```sh
+cargo build --release --bin xref-mcp
+```
+
+Example MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "xref-indexer": {
+      "command": "/absolute/path/to/xref-indexer/target/release/xref-mcp"
+    }
+  }
+}
+```
+
+Available tools:
+
+| Tool | Purpose |
+|------|---------|
+| `xref_index` | Build or rebuild the SQLite index for one or more roots |
+| `xref_reindex` | Incrementally update changed/new/deleted files |
+| `xref_find` | Find exact definition candidates, with optional snippets |
+| `xref_search` | Search definitions by substring |
+| `xref_refs` | Query stored refs, for DBs built with `references=calls` or `references=all` |
+| `xref_callers` / `xref_callees` | Walk structural call graph endpoints |
+| `xref_hierarchy` | Show base and derived classes |
+| `xref_context` | Fetch source context by symbol or by file/line |
+| `xref_expand` | Expand a caller/callee graph around a seed symbol |
+| `xref_stats` | Return DB summary and indexed files |
+| `xref_sql` | Run read-only SQL beginning with `SELECT`, `WITH`, or `PRAGMA` |
+
 ## Performance benchmarking
 
 The library exposes `Indexer::index_with_metrics()` and `xref_indexer::benchmark::run(...)` for timed runs. The CLI `bench` command reports discovery, parse, build, SQLite save, row counts, byte counts, lossy-decoded file counts, thread count, and final DB size as JSON. `bench` is no-save by default unless `--db` or `--save` is provided.
