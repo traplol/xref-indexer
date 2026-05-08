@@ -920,6 +920,81 @@ pub fn load_index_config(conn: &Connection) -> rusqlite::Result<Option<IndexConf
     }))
 }
 
+pub fn infer_index_config_from_files(conn: &Connection) -> rusqlite::Result<Option<IndexConfig>> {
+    create_schema(conn)?;
+    let mut stmt = conn.prepare("SELECT path, language FROM files ORDER BY path")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            PathBuf::from(row.get::<_, String>(0)?),
+            row.get::<_, String>(1)?,
+        ))
+    })?;
+
+    let mut paths = Vec::new();
+    let mut languages = BTreeMap::<String, usize>::new();
+    for row in rows {
+        let (path, language) = row?;
+        paths.push(path);
+        *languages.entry(language).or_default() += 1;
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(root) = infer_common_index_root(&paths) else {
+        return Ok(None);
+    };
+    if is_filesystem_root(&root) || !root.exists() {
+        return Ok(None);
+    }
+
+    let language = languages
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(language, _)| language)
+        .unwrap_or_else(|| "cpp".to_string());
+
+    Ok(Some(IndexConfig {
+        roots: vec![root],
+        language,
+        follow_symlinks: false,
+        reference_mode: "none".to_string(),
+        include_reference_context: false,
+    }))
+}
+
+fn infer_common_index_root(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut parents = paths.iter().map(|path| file_parent(path));
+    let mut common = parents.next()?;
+
+    for parent in parents {
+        while !parent.starts_with(&common) {
+            if !common.pop() || common.as_os_str().is_empty() {
+                return Some(PathBuf::from("."));
+            }
+        }
+    }
+
+    if common.as_os_str().is_empty() {
+        Some(PathBuf::from("."))
+    } else {
+        Some(common)
+    }
+}
+
+fn file_parent(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        parent.to_path_buf()
+    }
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.has_root() && path.components().count() == 1
+}
+
 fn delete_file_rows(
     tx: &rusqlite::Transaction<'_>,
     path: &Path,

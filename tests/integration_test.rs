@@ -654,6 +654,69 @@ fn test_cli_query_auto_reindexes_saved_roots() {
 }
 
 #[test]
+fn test_cli_query_infers_roots_for_legacy_db_without_saved_roots() {
+    let root = unique_db_path("xref-indexer-legacy-root");
+    std::fs::create_dir_all(&root).expect("create temp root");
+    std::fs::write(
+        root.join("a.cpp"),
+        "int legacy_before_query_change() { return 1; }\n",
+    )
+    .expect("write source");
+
+    let db_path = unique_db_path("xref-indexer-legacy-db");
+    let index = Indexer::builder()
+        .add_directory(&root)
+        .language(Language::Cpp)
+        .reference_mode(ReferenceMode::All)
+        .build()
+        .index()
+        .expect("legacy index should succeed");
+    index
+        .save_to_db(&db_path)
+        .expect("legacy save should succeed");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open legacy db");
+    assert!(
+        xref_indexer::db::load_index_config(&conn)
+            .expect("load legacy config")
+            .is_none(),
+        "legacy save should not persist roots"
+    );
+    drop(conn);
+
+    std::fs::write(
+        root.join("a.cpp"),
+        "int legacy_before_query_change() { return 1; }\nint added_from_legacy_query() { return legacy_before_query_change(); }\n",
+    )
+    .expect("modify source");
+
+    let db_arg = db_path.to_string_lossy().to_string();
+    let find = run_cli_json(&[
+        "find",
+        "--db",
+        &db_arg,
+        "added_from_legacy_query",
+        "--limit",
+        "5",
+        "--no-snippets",
+    ]);
+    assert_eq!(find["ok"], true);
+    assert_eq!(find["reindex"]["checked"], true);
+    assert_eq!(find["reindex"]["source"], "inferred_files");
+    assert_eq!(find["reindex"]["metrics"]["files_indexed"], 1);
+    assert_eq!(find["result_count"], 1);
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open repaired db");
+    let saved = xref_indexer::db::load_index_config(&conn)
+        .expect("load repaired config")
+        .expect("repaired config should be saved");
+    assert_eq!(saved.roots, vec![root.clone()]);
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_benchmark_run_reports_metrics_without_save() {
     let report = benchmark::run(BenchmarkConfig {
         roots: vec![fixtures_dir()],

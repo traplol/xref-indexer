@@ -386,11 +386,18 @@ fn auto_reindex_config(args: &ParsedArgs, db: &str) -> Result<Option<AutoReindex
     .map_err(|e| format!("failed to open database '{db}' for auto-reindex: {e}"))?;
     let stored = xref_indexer::db::load_index_config(&conn)
         .map_err(|e| format!("failed to load saved index roots from '{db}': {e}"))?;
-    drop(conn);
-
-    let Some(stored) = stored else {
-        return Ok(None);
+    let (stored, source) = if let Some(stored) = stored {
+        (stored, "saved_config")
+    } else {
+        let inferred = xref_indexer::db::infer_index_config_from_files(&conn)
+            .map_err(|e| format!("failed to infer index roots from '{db}': {e}"))?;
+        let Some(inferred) = inferred else {
+            drop(conn);
+            return Ok(None);
+        };
+        (inferred, "inferred_files")
     };
+    drop(conn);
 
     let language = parse_language(
         args.value("language")
@@ -419,7 +426,7 @@ fn auto_reindex_config(args: &ParsedArgs, db: &str) -> Result<Option<AutoReindex
         follow_symlinks,
         reference_mode,
         include_reference_context,
-        source: "saved_config",
+        source,
     }))
 }
 

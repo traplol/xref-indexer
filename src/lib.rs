@@ -7,7 +7,8 @@ pub mod types;
 pub mod db {
     //! SQLite persistence for the cross-reference index.
     pub use crate::db_impl::{
-        create_schema, load_index_config, open_from_db, save_index_config, save_to_db, IndexConfig,
+        create_schema, infer_index_config_from_files, load_index_config, open_from_db,
+        save_index_config, save_to_db, IndexConfig,
     };
 }
 mod db_impl;
