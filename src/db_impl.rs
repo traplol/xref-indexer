@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
+use rustc_hash::FxHashMap;
 
 use crate::index::Index;
 use crate::types::*;
@@ -15,7 +16,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             path TEXT NOT NULL UNIQUE,
             language TEXT NOT NULL,
             checksum TEXT,
@@ -23,7 +24,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS definitions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             qualified_name TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -40,7 +41,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS refs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             kind TEXT NOT NULL DEFAULT 'function',
             file_id INTEGER REFERENCES files(id),
@@ -51,7 +52,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS call_graph (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             caller_id INTEGER REFERENCES definitions(id),
             callee_id INTEGER REFERENCES definitions(id),
             file_id INTEGER REFERENCES files(id),
@@ -62,7 +63,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS inheritance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             derived_id INTEGER REFERENCES definitions(id),
             base_id INTEGER REFERENCES definitions(id),
             access TEXT NOT NULL DEFAULT 'public',
@@ -88,8 +89,12 @@ fn create_indexes(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_refs_def ON refs(def_id);
         CREATE INDEX IF NOT EXISTS idx_call_graph_caller ON call_graph(caller_id);
         CREATE INDEX IF NOT EXISTS idx_call_graph_callee ON call_graph(callee_id);
+        CREATE INDEX IF NOT EXISTS idx_call_graph_caller_name ON call_graph(caller_name);
+        CREATE INDEX IF NOT EXISTS idx_call_graph_callee_name ON call_graph(callee_name);
         CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(derived_id);
         CREATE INDEX IF NOT EXISTS idx_inheritance_base ON inheritance(base_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_derived_name ON inheritance(derived_name);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_base_name ON inheritance(base_name);
         ",
     )
 }
@@ -106,8 +111,12 @@ fn drop_indexes(conn: &Connection) -> rusqlite::Result<()> {
         DROP INDEX IF EXISTS idx_refs_def;
         DROP INDEX IF EXISTS idx_call_graph_caller;
         DROP INDEX IF EXISTS idx_call_graph_callee;
+        DROP INDEX IF EXISTS idx_call_graph_caller_name;
+        DROP INDEX IF EXISTS idx_call_graph_callee_name;
         DROP INDEX IF EXISTS idx_inheritance_derived;
         DROP INDEX IF EXISTS idx_inheritance_base;
+        DROP INDEX IF EXISTS idx_inheritance_derived_name;
+        DROP INDEX IF EXISTS idx_inheritance_base_name;
         ",
     )
 }
@@ -129,8 +138,8 @@ fn ensure_parent_name_column(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn resolve_db_definition_id(
-    qname_to_db_id: &std::collections::HashMap<&str, i64>,
-    name_to_db_ids: &std::collections::HashMap<&str, Vec<i64>>,
+    qname_to_db_id: &FxHashMap<&str, i64>,
+    name_to_db_ids: &FxHashMap<&str, Vec<i64>>,
     name: &str,
 ) -> Option<i64> {
     qname_to_db_id.get(name).copied().or_else(|| {
@@ -166,33 +175,34 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
     )?;
 
     // Insert files from the index's first-class file collection.
-    let mut file_ids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut file_ids: FxHashMap<PathBuf, i64> = FxHashMap::default();
+    file_ids.reserve(index.files().len());
     {
-        let mut insert_stmt = tx.prepare("INSERT INTO files (path, language) VALUES (?1, ?2)")?;
-        for f in index.files() {
+        let mut insert_stmt =
+            tx.prepare("INSERT INTO files (id, path, language) VALUES (?1, ?2, ?3)")?;
+        for (i, f) in index.files().iter().enumerate() {
+            let db_id = i as i64 + 1;
             let path_str = f.path.to_str().unwrap_or("");
-            insert_stmt.execute(params![path_str, f.language.as_str()])?;
-            file_ids.insert(path_str.to_string(), tx.last_insert_rowid());
+            insert_stmt.execute(params![db_id, path_str, f.language.as_str()])?;
+            file_ids.insert(f.path.clone(), db_id);
         }
     }
 
     // Insert definitions; build maps for later resolution.
     let mut def_id_map: Vec<i64> = Vec::with_capacity(index.definitions().len());
-    let mut qname_to_db_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
-    let mut name_to_db_ids: std::collections::HashMap<&str, Vec<i64>> =
-        std::collections::HashMap::new();
+    let mut qname_to_db_id: FxHashMap<&str, i64> = FxHashMap::default();
+    let mut name_to_db_ids: FxHashMap<&str, Vec<i64>> = FxHashMap::default();
+    qname_to_db_id.reserve(index.definitions().len());
+    name_to_db_ids.reserve(index.definitions().len());
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO definitions (name, qualified_name, kind, file_id, line, column, end_line, end_column, parent_name, signature, visibility, is_definition, extra) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO definitions (id, name, qualified_name, kind, file_id, line, column, end_line, end_column, parent_name, signature, visibility, is_definition, extra) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         )?;
-        for d in index.definitions() {
-            let file_id = d
-                .location
-                .file
-                .to_str()
-                .and_then(|p| file_ids.get(p))
-                .copied();
+        for (i, d) in index.definitions().iter().enumerate() {
+            let db_id = i as i64 + 1;
+            let file_id = file_ids.get(&d.location.file).copied();
             stmt.execute(params![
+                db_id,
                 d.name,
                 d.qualified_name,
                 d.kind.as_str(),
@@ -207,7 +217,6 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
                 d.is_definition as i64,
                 d.extra,
             ])?;
-            let db_id = tx.last_insert_rowid();
             def_id_map.push(db_id);
             qname_to_db_id.insert(&d.qualified_name, db_id);
             name_to_db_ids.entry(&d.name).or_default().push(db_id);
@@ -220,12 +229,7 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
             "INSERT INTO refs (name, kind, file_id, line, column, def_id, context) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         )?;
         for r in index.references() {
-            let file_id = r
-                .location
-                .file
-                .to_str()
-                .and_then(|p| file_ids.get(p))
-                .copied();
+            let file_id = file_ids.get(&r.location.file).copied();
             let db_def_id = r
                 .def_id
                 .and_then(|def_id| def_id_map.get(def_id.0))
@@ -248,12 +252,7 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
             "INSERT INTO call_graph (caller_id, callee_id, caller_name, callee_name, file_id, line, column) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         )?;
         for call in index.calls() {
-            let file_id = call
-                .location
-                .file
-                .to_str()
-                .and_then(|p| file_ids.get(p))
-                .copied();
+            let file_id = file_ids.get(&call.location.file).copied();
             let caller_id =
                 resolve_db_definition_id(&qname_to_db_id, &name_to_db_ids, &call.caller_name);
             let callee_id =

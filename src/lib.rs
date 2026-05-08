@@ -16,11 +16,12 @@ pub mod query {
     pub use crate::index::ClassHierarchy;
 }
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
+use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 use walkdir::WalkDir;
 
@@ -30,7 +31,8 @@ use crate::cpp_parser::CppParser;
 use crate::index::IndexBuilder;
 use crate::parser::Parser;
 
-const INDEXER_STACK_SIZE: usize = 64 * 1024 * 1024;
+const INDEXER_STACK_SIZE: usize = 8 * 1024 * 1024;
+const PARSE_CHUNK_SIZE: usize = 1;
 
 /// Timings and counts from one indexing pass.
 #[derive(Debug, Clone, Serialize)]
@@ -380,42 +382,55 @@ fn parse_files(
         return Ok(ParsedFiles::default());
     }
 
-    let queue: Arc<Mutex<VecDeque<(usize, PathBuf)>>> =
-        Arc::new(Mutex::new(files.into_iter().enumerate().collect()));
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|worker_id| format!("xref-indexer-worker-{worker_id}"))
+        .stack_size(INDEXER_STACK_SIZE)
+        .build()
+        .map_err(|e| format!("failed to start parser worker pool: {e}"))?;
 
-    let mut batches = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(threads);
-        for worker_id in 0..threads {
-            let queue = Arc::clone(&queue);
-            let handle = std::thread::Builder::new()
-                .name(format!("xref-indexer-worker-{worker_id}"))
-                .stack_size(INDEXER_STACK_SIZE)
-                .spawn_scoped(scope, move || {
-                    parse_worker(queue, language, reference_mode, include_reference_context)
-                })
-                .map_err(|e| format!("failed to start parser worker: {e}"))?;
-            handles.push(handle);
-        }
+    let files = Arc::new(files);
+    let next_file = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = mpsc::channel();
 
-        let mut batches = Vec::with_capacity(threads);
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(batch)) => batches.push(batch),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err("parser worker panicked".to_string()),
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.scope(|scope| {
+            for _ in 0..threads {
+                let files = Arc::clone(&files);
+                let next_file = Arc::clone(&next_file);
+                let sender = sender.clone();
+                scope.spawn(move |_| {
+                    let result = parse_worker(
+                        files,
+                        next_file,
+                        language,
+                        reference_mode,
+                        include_reference_context,
+                    );
+                    let _ = sender.send(result);
+                });
             }
-        }
-        Ok(batches)
-    })?;
+        });
+    }))
+    .map_err(|_| "parser worker panicked".to_string())?;
+    drop(sender);
 
-    let total_files = batches.iter().map(|batch| batch.files.len()).sum();
+    let mut batches = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        match receiver.recv() {
+            Ok(Ok(batch)) => batches.push(batch),
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(format!("parser worker did not report results: {e}")),
+        }
+    }
+
     let mut parsed = ParsedFiles {
-        files: Vec::with_capacity(total_files),
+        files: Vec::with_capacity(batches.iter().map(|batch| batch.files.len()).sum()),
         bytes_read: batches.iter().map(|batch| batch.bytes_read).sum(),
         lossy_decoded_files: batches.iter().map(|batch| batch.lossy_decoded_files).sum(),
     };
 
-    for batch in batches.drain(..) {
+    for batch in batches {
         parsed.files.extend(batch.files);
     }
     parsed.files.sort_by_key(|file| file.index);
@@ -423,7 +438,8 @@ fn parse_files(
 }
 
 fn parse_worker(
-    queue: Arc<Mutex<VecDeque<(usize, PathBuf)>>>,
+    files: Arc<Vec<PathBuf>>,
+    next_file: Arc<AtomicUsize>,
     language: Language,
     reference_mode: ReferenceMode,
     include_reference_context: bool,
@@ -432,21 +448,22 @@ fn parse_worker(
     let mut parsed = ParsedFiles::default();
 
     loop {
-        let Some((index, path)) = queue
-            .lock()
-            .map_err(|_| "parser queue mutex poisoned".to_string())?
-            .pop_front()
-        else {
+        let start = next_file.fetch_add(PARSE_CHUNK_SIZE, Ordering::Relaxed);
+        if start >= files.len() {
             break;
-        };
+        }
+        let end = (start + PARSE_CHUNK_SIZE).min(files.len());
 
-        let source = read_source_lossy(&path)?;
-        parsed.bytes_read += source.bytes as u64;
-        parsed.lossy_decoded_files += usize::from(source.decoded_lossy);
-        let symbols = parser
-            .parse_file(&path, &source.source)
-            .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-        parsed.files.push(ParsedFile { index, symbols });
+        for index in start..end {
+            let path = &files[index];
+            let source = read_source_lossy(path)?;
+            parsed.bytes_read += source.bytes as u64;
+            parsed.lossy_decoded_files += usize::from(source.decoded_lossy);
+            let symbols = parser
+                .parse_file(path, &source.source)
+                .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+            parsed.files.push(ParsedFile { index, symbols });
+        }
     }
 
     Ok(parsed)

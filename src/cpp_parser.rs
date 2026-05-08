@@ -1,6 +1,6 @@
-use std::collections::HashSet;
 use std::path::Path;
 
+use rustc_hash::FxHashSet;
 use tree_sitter::{Language, Node, Parser as TsParser, Point};
 
 use crate::parser::Parser;
@@ -8,6 +8,7 @@ use crate::types::*;
 use crate::ReferenceMode;
 
 const MAX_PARSE_DEPTH: usize = 512;
+type LocationKey = u64;
 
 /// C/C++ parser using tree-sitter.
 pub struct CppParser {
@@ -105,8 +106,8 @@ struct ParseState<'a> {
     source: &'a str,
     file: &'a Path,
     collect_definitions: bool,
-    def_locations: HashSet<(usize, usize)>,
-    handled_ref_locations: HashSet<(usize, usize)>,
+    def_locations: FxHashSet<LocationKey>,
+    handled_ref_locations: FxHashSet<LocationKey>,
     definitions: Vec<Definition>,
     references: Vec<Reference>,
     calls: Vec<CallEdge>,
@@ -116,7 +117,7 @@ struct ParseState<'a> {
     current_function: Option<String>,
     reference_mode: ReferenceMode,
     include_reference_context: bool,
-    line_starts: Vec<usize>,
+    line_starts: Option<Vec<usize>>,
 }
 
 impl<'a> ParseState<'a> {
@@ -126,20 +127,23 @@ impl<'a> ParseState<'a> {
         reference_mode: ReferenceMode,
         include_reference_context: bool,
     ) -> Self {
-        let mut line_starts = vec![0];
-        line_starts.extend(
-            source
-                .bytes()
-                .enumerate()
-                .filter(|(_, b)| *b == b'\n')
-                .map(|(i, _)| i + 1),
-        );
+        let line_starts = include_reference_context.then(|| {
+            let mut line_starts = vec![0];
+            line_starts.extend(
+                source
+                    .bytes()
+                    .enumerate()
+                    .filter(|(_, b)| *b == b'\n')
+                    .map(|(i, _)| i + 1),
+            );
+            line_starts
+        });
         Self {
             source,
             file,
             collect_definitions: true,
-            def_locations: HashSet::new(),
-            handled_ref_locations: HashSet::new(),
+            def_locations: FxHashSet::default(),
+            handled_ref_locations: FxHashSet::default(),
             definitions: Vec::new(),
             references: Vec::new(),
             calls: Vec::new(),
@@ -224,11 +228,12 @@ impl<'a> ParseState<'a> {
     }
 
     fn line_context(&self, line: usize) -> Option<String> {
-        if line == 0 || line > self.line_starts.len() {
+        let line_starts = self.line_starts.as_ref()?;
+        if line == 0 || line > line_starts.len() {
             return None;
         }
-        let start = self.line_starts[line - 1];
-        let end = match self.line_starts.get(line) {
+        let start = line_starts[line - 1];
+        let end = match line_starts.get(line) {
             Some(&e) => {
                 if e > 0 && self.source.as_bytes()[e - 1] == b'\n' {
                     e - 1
@@ -334,7 +339,8 @@ impl<'a> ParseState<'a> {
                                 self.point_to_location(node.start_position(), node.end_position())
                             });
 
-                        self.def_locations.insert((name_loc.line, name_loc.column));
+                        self.def_locations
+                            .insert(location_key(name_loc.line, name_loc.column));
                         self.definitions.push(Definition {
                             id: None,
                             name: name.clone(),
@@ -383,7 +389,8 @@ impl<'a> ParseState<'a> {
                     if let Some(name) = node.child_by_field_name("name") {
                         let loc =
                             self.point_to_location(name.start_position(), name.end_position());
-                        self.def_locations.insert((loc.line, loc.column));
+                        self.def_locations
+                            .insert(location_key(loc.line, loc.column));
                         let qn = self.qualified_name(&self.node_text(name));
                         self.definitions.push(Definition {
                             id: None,
@@ -419,7 +426,8 @@ impl<'a> ParseState<'a> {
                             name_node.start_position(),
                             name_node.end_position(),
                         );
-                        self.def_locations.insert((loc.line, loc.column));
+                        self.def_locations
+                            .insert(location_key(loc.line, loc.column));
                         let qn = self.qualified_name(&name);
                         self.definitions.push(Definition {
                             id: None,
@@ -505,7 +513,8 @@ impl<'a> ParseState<'a> {
     fn register_def(&mut self, name: &str, node: Node, kind: SymbolKind, is_definition: bool) {
         let name_node = find_name_node(node, self.source).unwrap_or(node);
         let loc = self.point_to_location(name_node.start_position(), name_node.end_position());
-        self.def_locations.insert((loc.line, loc.column));
+        self.def_locations
+            .insert(location_key(loc.line, loc.column));
         let qn = self.qualified_name(name);
         self.definitions.push(Definition {
             id: None,
@@ -538,7 +547,8 @@ impl<'a> ParseState<'a> {
                     .unwrap_or(node);
                 let name_loc =
                     self.point_to_location(name_node.start_position(), name_node.end_position());
-                self.def_locations.insert((name_loc.line, name_loc.column));
+                self.def_locations
+                    .insert(location_key(name_loc.line, name_loc.column));
                 self.definitions.push(Definition {
                     id: None,
                     name,
@@ -583,7 +593,8 @@ impl<'a> ParseState<'a> {
         if let Some(name_node) = name_node {
             let name = self.node_text(name_node).to_string();
             let loc = self.point_to_location(name_node.start_position(), name_node.end_position());
-            self.def_locations.insert((loc.line, loc.column));
+            self.def_locations
+                .insert(location_key(loc.line, loc.column));
             let qn = self.qualified_name(&name);
             let is_field = self
                 .scope_stack
@@ -618,7 +629,8 @@ impl<'a> ParseState<'a> {
         if let Some(name_node) = node.child_by_field_name("name") {
             let name = self.node_text(name_node).to_string();
             let loc = self.point_to_location(name_node.start_position(), name_node.end_position());
-            self.def_locations.insert((loc.line, loc.column));
+            self.def_locations
+                .insert(location_key(loc.line, loc.column));
             self.definitions.push(Definition {
                 id: None,
                 name,
@@ -647,7 +659,8 @@ impl<'a> ParseState<'a> {
         if let Some(name_node) = name_node {
             let name = self.node_text(name_node).to_string();
             let loc = self.point_to_location(name_node.start_position(), name_node.end_position());
-            self.def_locations.insert((loc.line, loc.column));
+            self.def_locations
+                .insert(location_key(loc.line, loc.column));
             let qn = self.qualified_name(&name);
             self.definitions.push(Definition {
                 id: None,
@@ -667,8 +680,12 @@ impl<'a> ParseState<'a> {
     fn handle_reference(&mut self, node: Node) {
         let loc = self.point_to_location(node.start_position(), node.end_position());
         // Skip definition sites and already-handled call callees.
-        if self.def_locations.contains(&(loc.line, loc.column))
-            || self.handled_ref_locations.contains(&(loc.line, loc.column))
+        if self
+            .def_locations
+            .contains(&location_key(loc.line, loc.column))
+            || self
+                .handled_ref_locations
+                .contains(&location_key(loc.line, loc.column))
         {
             return;
         }
@@ -722,7 +739,7 @@ impl<'a> ParseState<'a> {
                 return;
             }
 
-            let loc_key = (callee_loc.line, callee_loc.column);
+            let loc_key = location_key(callee_loc.line, callee_loc.column);
             if !self.def_locations.contains(&loc_key)
                 && !self.handled_ref_locations.contains(&loc_key)
             {
@@ -807,6 +824,10 @@ fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         }
     }
     None
+}
+
+fn location_key(line: usize, column: usize) -> LocationKey {
+    ((line as u64) << 32) | (column as u64 & 0xffff_ffff)
 }
 
 fn descendant_of_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {

@@ -1,5 +1,8 @@
 use std::path::PathBuf;
+use std::process::Command;
 
+use serde_json::Value;
+use xref_indexer::benchmark::{self, BenchmarkConfig};
 use xref_indexer::types::{SymbolKind, Visibility};
 use xref_indexer::{Indexer, Language, ReferenceMode};
 
@@ -15,6 +18,29 @@ fn fixture_index() -> xref_indexer::Index {
         .build()
         .index()
         .expect("indexing should succeed")
+}
+
+fn unique_db_path(prefix: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{unique}.sqlite3", std::process::id()))
+}
+
+fn run_cli_json(args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_xref-indexer"))
+        .args(args)
+        .output()
+        .expect("run xref-indexer CLI");
+    assert!(
+        output.status.success(),
+        "CLI failed with status {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("CLI should emit JSON")
 }
 
 #[test]
@@ -427,4 +453,83 @@ fn test_save_and_load_db() {
 
     // Clean up.
     let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_cli_queries_saved_sqlite_db() {
+    let index = fixture_index();
+    let db_path = unique_db_path("xref-indexer-cli-query");
+    let conn = index.save_to_db(&db_path).expect("save should succeed");
+    drop(conn);
+
+    let db = db_path.to_string_lossy().to_string();
+    let stats = run_cli_json(&["stats", "--db", &db]);
+    assert_eq!(stats["ok"], true);
+    assert_eq!(
+        stats["summary"]["definitions"].as_u64(),
+        Some(index.definition_count() as u64)
+    );
+
+    let find = run_cli_json(&[
+        "find",
+        "--db",
+        &db,
+        "demo::Derived::run",
+        "--limit",
+        "5",
+        "--no-snippets",
+    ]);
+    assert_eq!(find["ok"], true);
+    assert_eq!(find["results"][0]["confidence"], "exact_qualified");
+    assert_eq!(
+        find["results"][0]["definition"]["qualified_name"],
+        "demo::Derived::run"
+    );
+
+    let callers = run_cli_json(&[
+        "callers",
+        "--db",
+        &db,
+        "compute",
+        "--limit",
+        "10",
+        "--no-snippets",
+    ]);
+    let caller_names: Vec<_> = callers["results"]
+        .as_array()
+        .expect("callers results should be an array")
+        .iter()
+        .filter_map(|hit| hit["definition"]["qualified_name"].as_str())
+        .collect();
+    assert!(
+        caller_names.contains(&"demo::Derived::run"),
+        "expected Derived::run caller; got {caller_names:?}"
+    );
+    assert!(
+        caller_names.contains(&"main"),
+        "expected main caller; got {caller_names:?}"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_benchmark_run_reports_metrics_without_save() {
+    let report = benchmark::run(BenchmarkConfig {
+        roots: vec![fixtures_dir()],
+        language: Language::Cpp,
+        reference_mode: ReferenceMode::Calls,
+        db_path: None,
+        ..BenchmarkConfig::default()
+    })
+    .expect("benchmark should succeed");
+
+    assert!(
+        report.save.is_none(),
+        "no-save benchmark should not save DB"
+    );
+    assert_eq!(report.index.files_indexed, 2);
+    assert!(report.index.definitions >= 15);
+    assert!(report.index.calls > 0);
+    assert!(report.total_ms >= report.index.total_ms);
 }

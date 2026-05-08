@@ -48,51 +48,41 @@ impl Index {
     }
 
     fn build_lookups(&mut self) {
+        self.defs_by_name.reserve(self.definitions.len());
+        self.defs_by_qualified_name.reserve(self.definitions.len());
+        self.refs_by_name.reserve(self.references.len());
+        self.callers.reserve(self.calls.len());
+        self.callees.reserve(self.calls.len());
+        self.inherits_from.reserve(self.inherits.len() * 2);
+        self.base_of.reserve(self.inherits.len() * 2);
+
         for (i, def) in self.definitions.iter().enumerate() {
             let id = DefId(i);
-            self.defs_by_name
-                .entry(def.name.clone())
-                .or_default()
-                .push(id);
+            push_lookup(&mut self.defs_by_name, &def.name, id);
             self.defs_by_qualified_name
                 .insert(def.qualified_name.clone(), id);
         }
 
         for (i, r) in self.references.iter().enumerate() {
-            self.refs_by_name.entry(r.name.clone()).or_default().push(i);
+            push_lookup(&mut self.refs_by_name, &r.name, i);
         }
 
         for (i, call) in self.calls.iter().enumerate() {
-            self.callers
-                .entry(call.callee_name.clone())
-                .or_default()
-                .push(i);
-            self.callees
-                .entry(call.caller_name.clone())
-                .or_default()
-                .push(i);
+            push_lookup(&mut self.callers, &call.callee_name, i);
+            push_lookup(&mut self.callees, &call.caller_name, i);
         }
 
         for (i, inh) in self.inherits.iter().enumerate() {
-            self.inherits_from
-                .entry(inh.derived_name.clone())
-                .or_default()
-                .push(i);
+            push_lookup(&mut self.inherits_from, &inh.derived_name, i);
             if let Some(simple) = simple_name(&inh.derived_name) {
                 if simple != inh.derived_name {
-                    self.inherits_from
-                        .entry(simple.to_string())
-                        .or_default()
-                        .push(i);
+                    push_lookup(&mut self.inherits_from, simple, i);
                 }
             }
-            self.base_of
-                .entry(inh.base_name.clone())
-                .or_default()
-                .push(i);
+            push_lookup(&mut self.base_of, &inh.base_name, i);
             if let Some(simple) = simple_name(&inh.base_name) {
                 if simple != inh.base_name {
-                    self.base_of.entry(simple.to_string()).or_default().push(i);
+                    push_lookup(&mut self.base_of, simple, i);
                 }
             }
         }
@@ -290,10 +280,16 @@ impl IndexBuilder {
     }
 
     fn resolve_references(&mut self) {
+        if self.references.is_empty() {
+            return;
+        }
+
         // Build borrowed lookups so large runs do not clone hundreds of
         // thousands of definition names just to resolve reference IDs.
         let mut qualified_to_id: FxHashMap<&str, usize> = FxHashMap::default();
         let mut unique_name_to_id: FxHashMap<&str, Option<usize>> = FxHashMap::default();
+        qualified_to_id.reserve(self.definitions.len());
+        unique_name_to_id.reserve(self.definitions.len());
         for (i, def) in self.definitions.iter().enumerate() {
             qualified_to_id.insert(def.qualified_name.as_str(), i);
             unique_name_to_id
@@ -322,4 +318,12 @@ impl Default for IndexBuilder {
 
 fn simple_name(name: &str) -> Option<&str> {
     name.rsplit("::").next()
+}
+
+fn push_lookup<T>(map: &mut FxHashMap<String, Vec<T>>, key: &str, value: T) {
+    if let Some(values) = map.get_mut(key) {
+        values.push(value);
+    } else {
+        map.insert(key.to_string(), vec![value]);
+    }
 }

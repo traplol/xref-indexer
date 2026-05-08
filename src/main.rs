@@ -4,10 +4,11 @@ use std::process;
 use std::time::Instant;
 
 use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::{json, Value};
 use xref_indexer::benchmark::{self, BenchmarkConfig};
-use xref_indexer::types::{CallEdge, Definition, Location, Reference};
+use xref_indexer::types::{CallEdge, Definition, Location, SymbolKind, Visibility};
 use xref_indexer::{Index, Indexer, Language, ReferenceMode};
 
 const DEFAULT_DB_PATH: &str = ".git/code-indexer/xrefs.sqlite3";
@@ -25,6 +26,16 @@ struct Snippet {
     start_line: usize,
     end_line: usize,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct DbReference {
+    id: Option<i64>,
+    name: String,
+    kind: String,
+    location: Location,
+    def_id: Option<i64>,
+    context: Option<String>,
 }
 
 fn main() {
@@ -240,7 +251,9 @@ fn cmd_index(args: &ParsedArgs) -> Result<Value, String> {
 fn cmd_benchmark(args: &ParsedArgs) -> Result<Value, String> {
     let roots = roots_from_args(args, "benchmark")?;
     let language = parse_language(args.value("language").or_else(|| args.value("lang")))?;
-    let db_path = (!args.bool_flag("no-save")).then(|| PathBuf::from(args.db_path()));
+    let should_save =
+        !args.bool_flag("no-save") && (args.bool_flag("save") || args.value("db").is_some());
+    let db_path = should_save.then(|| PathBuf::from(args.db_path()));
 
     if let Some(db) = &db_path {
         ensure_db_parent(db.to_string_lossy().as_ref())?;
@@ -265,19 +278,19 @@ fn cmd_benchmark(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_stats(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     Ok(json!({
         "ok": true,
         "command": "stats",
         "db": db,
-        "summary": index_summary(&index),
-        "files": index.files(),
+        "summary": db_summary(&conn)?,
+        "files": db_files(&conn)?,
     }))
 }
 
 fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
     let limit = args.limit();
     let radius = args.radius();
@@ -285,11 +298,10 @@ fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
 
     let mut seen = HashSet::new();
     let mut results = Vec::new();
-    let exact = index.find_definition(query);
-    for def in exact {
+    for def in db_definitions_for_name(&conn, query, Some(limit))? {
         if seen.insert(def.qualified_name.clone()) {
             results.push(def_hit(
-                def,
+                &def,
                 query,
                 results.len() + 1,
                 include_snippets,
@@ -299,13 +311,13 @@ fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
     }
 
     if results.is_empty() || args.bool_flag("include-search") {
-        for def in index.search_symbols(query) {
+        for def in db_search_definitions(&conn, query, limit.saturating_mul(4).max(limit))? {
             if results.len() >= limit {
                 break;
             }
             if seen.insert(def.qualified_name.clone()) {
                 results.push(def_hit(
-                    def,
+                    &def,
                     query,
                     results.len() + 1,
                     include_snippets,
@@ -329,13 +341,12 @@ fn cmd_find(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_search(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
     let include_snippets = !args.bool_flag("no-snippets");
     let radius = args.radius();
-    let results: Vec<Value> = index
-        .search_symbols(query)
-        .into_iter()
+    let results: Vec<Value> = db_search_definitions(&conn, query, args.limit())?
+        .iter()
         .take(args.limit())
         .enumerate()
         .map(|(i, def)| def_hit(def, query, i + 1, include_snippets, radius))
@@ -353,16 +364,15 @@ fn cmd_search(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_refs(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
     let include_snippets = !args.bool_flag("no-snippets");
     let radius = args.radius();
-    let mut refs = refs_for_query(&index, query);
-    refs.truncate(args.limit());
+    let refs = db_refs_for_query(&conn, query, args.limit())?;
     let results: Vec<Value> = refs
         .iter()
         .enumerate()
-        .map(|(i, r)| ref_hit(r, i + 1, include_snippets, radius))
+        .map(|(i, r)| db_ref_hit(r, i + 1, include_snippets, radius))
         .collect();
 
     Ok(json!({
@@ -377,16 +387,16 @@ fn cmd_refs(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_callers(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
-    let defs = call_endpoint_defs(&index, query, true, args.limit());
+    let defs = db_call_endpoint_defs(&conn, query, true, args.limit())?;
     Ok(json!({
         "ok": true,
         "command": "callers",
         "db": db,
         "query": query,
         "result_count": defs.len(),
-        "results": definition_hits_with_confidence(
+        "results": owned_definition_hits_with_confidence(
             &defs,
             "structural_call_endpoint",
             !args.bool_flag("no-snippets"),
@@ -397,16 +407,16 @@ fn cmd_callers(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_callees(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
-    let defs = call_endpoint_defs(&index, query, false, args.limit());
+    let defs = db_call_endpoint_defs(&conn, query, false, args.limit())?;
     Ok(json!({
         "ok": true,
         "command": "callees",
         "db": db,
         "query": query,
         "result_count": defs.len(),
-        "results": definition_hits_with_confidence(
+        "results": owned_definition_hits_with_confidence(
             &defs,
             "structural_call_endpoint",
             !args.bool_flag("no-snippets"),
@@ -417,22 +427,22 @@ fn cmd_callees(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_hierarchy(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
-    let hierarchy = index.class_hierarchy(query);
+    let (bases, derived) = db_class_hierarchy(&conn, query)?;
     Ok(json!({
         "ok": true,
         "command": "hierarchy",
         "db": db,
         "query": query,
-        "bases": definition_hits_with_confidence(
-            &hierarchy.bases,
+        "bases": owned_definition_hits_with_confidence(
+            &bases,
             "inheritance_edge",
             !args.bool_flag("no-snippets"),
             args.radius()
         ),
-        "derived": definition_hits_with_confidence(
-            &hierarchy.derived,
+        "derived": owned_definition_hits_with_confidence(
+            &derived,
             "inheritance_edge",
             !args.bool_flag("no-snippets"),
             args.radius()
@@ -456,12 +466,10 @@ fn cmd_context(args: &ParsedArgs) -> Result<Value, String> {
     }
 
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let query = args.first_symbol()?;
-    let defs = index.find_definition(query);
-    let results: Vec<Value> = defs
-        .into_iter()
-        .take(args.limit())
+    let results: Vec<Value> = db_definitions_for_name(&conn, query, Some(args.limit()))?
+        .iter()
         .map(|def| {
             json!({
                 "definition": definition_json(def),
@@ -482,7 +490,7 @@ fn cmd_context(args: &ParsedArgs) -> Result<Value, String> {
 
 fn cmd_expand(args: &ParsedArgs) -> Result<Value, String> {
     let db = args.db_path();
-    let index = open_index(db)?;
+    let conn = open_query_conn(db)?;
     let seed = args.first_symbol()?;
     let depth = args
         .value("depth")
@@ -494,30 +502,30 @@ fn cmd_expand(args: &ParsedArgs) -> Result<Value, String> {
     let include_snippets = !args.bool_flag("no-snippets");
     let radius = args.radius();
 
-    let mut frontier: HashSet<String> = aliases_for_seed(&index, seed).into_iter().collect();
+    let mut frontier: HashSet<String> = db_aliases_for_seed(&conn, seed)?.into_iter().collect();
     let mut visited_symbols = frontier.clone();
     let mut seen_edges = HashSet::new();
     let mut edges = Vec::new();
 
     for level in 1..=depth {
         let mut next = HashSet::new();
-        for call in index.calls() {
+        for call in db_call_edges_for_frontier(&conn, &frontier, direction)? {
             if edges.len() >= limit {
                 break;
             }
             if matches!(direction, "callers" | "both") && matches_any(&call.callee_name, &frontier)
             {
-                let key = edge_key(call);
+                let key = edge_key(&call);
                 if seen_edges.insert(key) {
-                    edges.push(call_hit(call, level, include_snippets, radius));
+                    edges.push(call_hit(&call, level, include_snippets, radius));
                     next.insert(call.caller_name.clone());
                 }
             }
             if matches!(direction, "callees" | "both") && matches_any(&call.caller_name, &frontier)
             {
-                let key = edge_key(call);
+                let key = edge_key(&call);
                 if seen_edges.insert(key) {
-                    edges.push(call_hit(call, level, include_snippets, radius));
+                    edges.push(call_hit(&call, level, include_snippets, radius));
                     next.insert(call.callee_name.clone());
                 }
             }
@@ -564,8 +572,7 @@ fn cmd_sql(args: &ParsedArgs) -> Result<Value, String> {
         );
     }
 
-    let conn = rusqlite::Connection::open(db)
-        .map_err(|e| format!("failed to open database '{db}': {e}"))?;
+    let conn = open_query_conn(db)?;
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("failed to prepare SQL: {e}"))?;
@@ -599,10 +606,520 @@ fn cmd_sql(args: &ParsedArgs) -> Result<Value, String> {
     }))
 }
 
-fn open_index(db: &str) -> Result<Index, String> {
-    let (index, _conn) =
-        Index::open_from_db(db).map_err(|e| format!("failed to open database '{db}': {e}"))?;
-    Ok(index)
+fn open_query_conn(db: &str) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("failed to open database '{db}': {e}"))?;
+    xref_indexer::db::create_schema(&conn)
+        .map_err(|e| format!("failed to prepare database schema '{db}': {e}"))?;
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys=ON;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA cache_size=-200000;
+        PRAGMA mmap_size=268435456;
+        PRAGMA query_only=ON;
+        ",
+    )
+    .map_err(|e| format!("failed to configure query database '{db}': {e}"))?;
+    Ok(conn)
+}
+
+fn db_summary(conn: &Connection) -> Result<Value, String> {
+    conn.query_row(
+        "
+        SELECT
+            (SELECT COUNT(*) FROM files),
+            (SELECT COUNT(*) FROM definitions),
+            (SELECT COUNT(*) FROM refs),
+            (SELECT COUNT(*) FROM call_graph),
+            (SELECT COUNT(*) FROM inheritance)
+        ",
+        [],
+        |row| {
+            Ok(json!({
+                "files": row.get::<_, i64>(0)?,
+                "definitions": row.get::<_, i64>(1)?,
+                "references": row.get::<_, i64>(2)?,
+                "calls": row.get::<_, i64>(3)?,
+                "inheritance_edges": row.get::<_, i64>(4)?,
+            }))
+        },
+    )
+    .map_err(|e| format!("failed to read database summary: {e}"))
+}
+
+fn db_files(conn: &Connection) -> Result<Vec<Value>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path, language FROM files ORDER BY id")
+        .map_err(|e| format!("failed to prepare files query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(json!({
+                "path": row.get::<_, String>(0)?,
+                "language": row.get::<_, String>(1)?,
+            }))
+        })
+        .map_err(|e| format!("failed to query files: {e}"))?;
+    collect_sql_rows(rows, "files")
+}
+
+const DEFINITION_SELECT: &str = "
+    SELECT
+        d.id,
+        d.name,
+        d.qualified_name,
+        d.kind,
+        f.path,
+        d.line,
+        d.column,
+        d.end_line,
+        d.end_column,
+        d.parent_name,
+        d.signature,
+        d.visibility,
+        d.is_definition,
+        d.extra
+    FROM definitions d
+    LEFT JOIN files f ON f.id = d.file_id
+";
+
+fn db_definition_by_id(conn: &Connection, id: i64) -> Result<Option<Definition>, String> {
+    let sql = format!("{DEFINITION_SELECT} WHERE d.id = ?1 LIMIT 1");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare definition-by-id query: {e}"))?;
+    stmt.query_row(params![id], row_to_definition)
+        .optional()
+        .map_err(|e| format!("failed to query definition id {id}: {e}"))
+}
+
+fn db_definition_by_qualified(
+    conn: &Connection,
+    qualified_name: &str,
+) -> Result<Option<Definition>, String> {
+    let sql = format!("{DEFINITION_SELECT} WHERE d.qualified_name = ?1 ORDER BY d.id LIMIT 1");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare qualified definition query: {e}"))?;
+    stmt.query_row(params![qualified_name], row_to_definition)
+        .optional()
+        .map_err(|e| format!("failed to query definition '{qualified_name}': {e}"))
+}
+
+fn db_definitions_by_simple(
+    conn: &Connection,
+    name: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Definition>, String> {
+    if matches!(limit, Some(0)) {
+        return Ok(Vec::new());
+    }
+    let sql = format!("{DEFINITION_SELECT} WHERE d.name = ?1 ORDER BY d.id LIMIT ?2");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare simple definition query: {e}"))?;
+    let rows = stmt
+        .query_map(params![name, sql_limit(limit)], row_to_definition)
+        .map_err(|e| format!("failed to query definitions named '{name}': {e}"))?;
+    collect_sql_rows(rows, "definitions")
+}
+
+fn db_definitions_for_name(
+    conn: &Connection,
+    name: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Definition>, String> {
+    if matches!(limit, Some(0)) {
+        return Ok(Vec::new());
+    }
+    if let Some(def) = db_definition_by_qualified(conn, name)? {
+        return Ok(vec![def]);
+    }
+    db_definitions_by_simple(conn, name, limit)
+}
+
+fn db_search_definitions(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<Definition>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "{DEFINITION_SELECT} WHERE lower(d.name) LIKE ?1 ESCAPE '\\' ORDER BY d.id LIMIT ?2"
+    );
+    let like_pattern = like_contains_pattern(pattern);
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare symbol search query: {e}"))?;
+    let rows = stmt
+        .query_map(params![like_pattern, limit as i64], row_to_definition)
+        .map_err(|e| format!("failed to search symbols for '{pattern}': {e}"))?;
+    collect_sql_rows(rows, "symbol search")
+}
+
+fn row_to_definition(row: &Row<'_>) -> rusqlite::Result<Definition> {
+    let kind = row.get::<_, String>(3)?;
+    let visibility = row.get::<_, String>(11)?;
+    Ok(Definition {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        qualified_name: row.get(2)?,
+        kind: SymbolKind::from_str(&kind).unwrap_or(SymbolKind::Function),
+        location: Location {
+            file: row
+                .get::<_, Option<String>>(4)?
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            line: row.get::<_, i64>(5)? as usize,
+            column: row.get::<_, i64>(6)? as usize,
+            end_line: row.get::<_, i64>(7)? as usize,
+            end_column: row.get::<_, i64>(8)? as usize,
+        },
+        parent: row.get(9)?,
+        signature: row.get(10)?,
+        visibility: Visibility::from_str(&visibility).unwrap_or(Visibility::Public),
+        is_definition: row.get::<_, i64>(12)? != 0,
+        extra: row.get(13)?,
+    })
+}
+
+fn db_refs_for_query(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<DbReference>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut names = query_aliases(query);
+    names.truncate(2);
+
+    let mut refs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT r.id, r.name, r.kind, f.path, r.line, r.column, r.def_id, r.context
+            FROM refs r
+            LEFT JOIN files f ON f.id = r.file_id
+            WHERE r.name = ?1
+            ORDER BY r.id
+            ",
+        )
+        .map_err(|e| format!("failed to prepare references query: {e}"))?;
+
+    for name in names {
+        let rows = stmt
+            .query_map(params![name], row_to_db_reference)
+            .map_err(|e| format!("failed to query references: {e}"))?;
+        for row in rows {
+            let reference = row.map_err(|e| format!("failed to read reference row: {e}"))?;
+            let key = (
+                reference.location.file.clone(),
+                reference.location.line,
+                reference.location.column,
+                reference.name.clone(),
+            );
+            if seen.insert(key) {
+                refs.push(reference);
+                if refs.len() >= limit {
+                    return Ok(refs);
+                }
+            }
+        }
+    }
+    Ok(refs)
+}
+
+fn row_to_db_reference(row: &Row<'_>) -> rusqlite::Result<DbReference> {
+    Ok(DbReference {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        location: Location {
+            file: row
+                .get::<_, Option<String>>(3)?
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            line: row.get::<_, i64>(4)? as usize,
+            column: row.get::<_, i64>(5)? as usize,
+            end_line: 0,
+            end_column: 0,
+        },
+        def_id: row.get(6)?,
+        context: row.get(7)?,
+    })
+}
+
+fn db_call_endpoint_defs(
+    conn: &Connection,
+    query: &str,
+    callers: bool,
+    limit: usize,
+) -> Result<Vec<Definition>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let endpoint_col = if callers {
+        "callee_name"
+    } else {
+        "caller_name"
+    };
+    let target_id_col = if callers { "caller_id" } else { "callee_id" };
+    let target_name_col = if callers {
+        "caller_name"
+    } else {
+        "callee_name"
+    };
+    let sql = format!(
+        "SELECT {target_id_col}, {target_name_col} FROM call_graph WHERE {endpoint_col} = ?1 ORDER BY id"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare call endpoint query: {e}"))?;
+    let mut defs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut def_cache_by_id: HashMap<i64, Option<Definition>> = HashMap::new();
+    let mut def_cache_by_name: HashMap<String, Vec<Definition>> = HashMap::new();
+
+    for name in query_aliases(query) {
+        let rows = stmt
+            .query_map(params![name], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(|e| format!("failed to query call endpoints: {e}"))?;
+        for row in rows {
+            let (target_id, target_name) =
+                row.map_err(|e| format!("failed to read call endpoint row: {e}"))?;
+            let mut candidates = Vec::new();
+            if let Some(id) = target_id {
+                let cached = match def_cache_by_id.get(&id) {
+                    Some(def) => def.clone(),
+                    None => {
+                        let def = db_definition_by_id(conn, id)?;
+                        def_cache_by_id.insert(id, def.clone());
+                        def
+                    }
+                };
+                if let Some(def) = cached {
+                    candidates.push(def);
+                }
+            }
+            if candidates.is_empty() {
+                if let Some(name) = target_name.as_deref() {
+                    let cached = match def_cache_by_name.get(name) {
+                        Some(defs) => defs.clone(),
+                        None => {
+                            let defs = db_definitions_for_name(conn, name, None)?;
+                            def_cache_by_name.insert(name.to_string(), defs.clone());
+                            defs
+                        }
+                    };
+                    candidates.extend(cached);
+                }
+            }
+            for def in candidates {
+                if seen.insert(def.qualified_name.clone()) {
+                    defs.push(def);
+                    if defs.len() >= limit {
+                        return Ok(defs);
+                    }
+                }
+            }
+        }
+    }
+    Ok(defs)
+}
+
+fn db_class_hierarchy(
+    conn: &Connection,
+    query: &str,
+) -> Result<(Vec<Definition>, Vec<Definition>), String> {
+    Ok((
+        db_direct_hierarchy_defs(conn, "derived_name", "base_name", query, false)?,
+        db_direct_hierarchy_defs(conn, "base_name", "derived_name", query, true)?,
+    ))
+}
+
+fn db_direct_hierarchy_defs(
+    conn: &Connection,
+    match_col: &str,
+    target_col: &str,
+    query: &str,
+    filter_derived: bool,
+) -> Result<Vec<Definition>, String> {
+    let names: HashSet<String> = [query.to_string()].into_iter().collect();
+    let (condition, values) = name_set_condition(match_col, &names);
+    let sql =
+        format!("SELECT {match_col}, {target_col} FROM inheritance WHERE {condition} ORDER BY id");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare hierarchy query: {e}"))?;
+    let rows = stmt
+        .query_map(params_from_iter(values.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("failed to query hierarchy: {e}"))?;
+
+    let suffix = format!("::{query}");
+    let mut defs = Vec::new();
+    for row in rows {
+        let (matched_name, target_name) =
+            row.map_err(|e| format!("failed to read hierarchy row: {e}"))?;
+        if filter_derived && matched_name != query && !matched_name.ends_with(&suffix) {
+            continue;
+        }
+        for def in db_definitions_for_name(conn, &target_name, None)? {
+            if !filter_derived || def.name == target_name || def.qualified_name == target_name {
+                defs.push(def);
+            }
+        }
+    }
+    Ok(defs)
+}
+
+fn db_aliases_for_seed(conn: &Connection, seed: &str) -> Result<Vec<String>, String> {
+    let mut aliases = query_aliases(seed);
+    for def in db_definitions_for_name(conn, seed, None)? {
+        aliases.push(def.name);
+        aliases.push(def.qualified_name);
+    }
+    aliases.sort();
+    aliases.dedup();
+    Ok(aliases)
+}
+
+fn db_call_edges_for_frontier(
+    conn: &Connection,
+    frontier: &HashSet<String>,
+    direction: &str,
+) -> Result<Vec<CallEdge>, String> {
+    let mut clauses = Vec::new();
+    let mut values = Vec::new();
+    if matches!(direction, "callers" | "both") {
+        let (condition, mut condition_values) = name_set_condition("cg.callee_name", frontier);
+        clauses.push(condition);
+        values.append(&mut condition_values);
+    }
+    if matches!(direction, "callees" | "both") {
+        let (condition, mut condition_values) = name_set_condition("cg.caller_name", frontier);
+        clauses.push(condition);
+        values.append(&mut condition_values);
+    }
+    if clauses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "
+        SELECT cg.caller_name, cg.callee_name, f.path, cg.line, cg.column
+        FROM call_graph cg
+        LEFT JOIN files f ON f.id = cg.file_id
+        WHERE {}
+        ORDER BY cg.id
+        ",
+        clauses.join(" OR ")
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed to prepare call expansion query: {e}"))?;
+    let rows = stmt
+        .query_map(params_from_iter(values.iter()), row_to_call_edge)
+        .map_err(|e| format!("failed to query call expansion: {e}"))?;
+    collect_sql_rows(rows, "call expansion")
+}
+
+fn row_to_call_edge(row: &Row<'_>) -> rusqlite::Result<CallEdge> {
+    Ok(CallEdge {
+        caller_name: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+        callee_name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        location: Location {
+            file: row
+                .get::<_, Option<String>>(2)?
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            line: row.get::<_, i64>(3)? as usize,
+            column: row.get::<_, i64>(4)? as usize,
+            end_line: 0,
+            end_column: 0,
+        },
+    })
+}
+
+fn name_set_condition(column: &str, names: &HashSet<String>) -> (String, Vec<String>) {
+    if names.is_empty() {
+        return ("0".to_string(), Vec::new());
+    }
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort();
+
+    let mut clauses = Vec::new();
+    let mut values = Vec::new();
+    clauses.push(format!(
+        "{column} IN ({})",
+        vec!["?"; sorted.len()].join(", ")
+    ));
+    values.extend(sorted.iter().map(|name| (*name).clone()));
+
+    for name in sorted {
+        if !name.contains("::") {
+            clauses.push(format!("{column} LIKE ? ESCAPE '\\'"));
+            values.push(like_qualified_suffix_pattern(name));
+        }
+    }
+    (format!("({})", clauses.join(" OR ")), values)
+}
+
+fn query_aliases(query: &str) -> Vec<String> {
+    let mut names = vec![query.to_string()];
+    if let Some(simple) = simple_name(query) {
+        if simple != query {
+            names.push(simple.to_string());
+        }
+    }
+    names
+}
+
+fn sql_limit(limit: Option<usize>) -> i64 {
+    limit.map(|n| n as i64).unwrap_or(-1)
+}
+
+fn like_contains_pattern(value: &str) -> String {
+    format!("%{}%", escape_like(&value.to_lowercase()))
+}
+
+fn like_qualified_suffix_pattern(value: &str) -> String {
+    format!("%::{}", escape_like(value))
+}
+
+fn escape_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn collect_sql_rows<T, F>(rows: rusqlite::MappedRows<'_, F>, label: &str) -> Result<Vec<T>, String>
+where
+    F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row.map_err(|e| format!("failed to read {label} row: {e}"))?);
+    }
+    Ok(values)
 }
 
 fn ensure_db_parent(db: &str) -> Result<(), String> {
@@ -644,8 +1161,8 @@ fn index_summary(index: &Index) -> Value {
     })
 }
 
-fn definition_hits_with_confidence(
-    defs: &[&Definition],
+fn owned_definition_hits_with_confidence(
+    defs: &[Definition],
     confidence: &str,
     include_snippets: bool,
     radius: usize,
@@ -686,11 +1203,16 @@ fn def_hit_with_confidence(
     })
 }
 
-fn ref_hit(reference: &Reference, rank: usize, include_snippets: bool, radius: usize) -> Value {
+fn db_ref_hit(
+    reference: &DbReference,
+    rank: usize,
+    include_snippets: bool,
+    radius: usize,
+) -> Value {
     json!({
         "rank": rank,
         "confidence": if reference.def_id.is_some() { "resolved_unique_name" } else { "unresolved_name" },
-        "reference": reference_json(reference),
+        "reference": db_reference_json(reference),
         "snippet": include_snippets.then(|| read_snippet(&reference.location.file, reference.location.line, radius)).flatten(),
     })
 }
@@ -719,13 +1241,13 @@ fn definition_json(def: &Definition) -> Value {
     })
 }
 
-fn reference_json(reference: &Reference) -> Value {
+fn db_reference_json(reference: &DbReference) -> Value {
     json!({
         "db_id": reference.id,
         "name": reference.name,
-        "kind": reference.kind.as_str(),
+        "kind": reference.kind,
         "location": location_json(&reference.location),
-        "def_id": reference.def_id.map(|id| id.0),
+        "def_id": reference.def_id,
         "context": reference.context,
     })
 }
@@ -756,79 +1278,6 @@ fn definition_confidence(def: &Definition, query: &str) -> &'static str {
     } else {
         "substring"
     }
-}
-
-fn refs_for_query<'a>(index: &'a Index, query: &str) -> Vec<&'a Reference> {
-    let mut names = vec![query.to_string()];
-    if let Some(simple) = simple_name(query) {
-        if simple != query {
-            names.push(simple.to_string());
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut refs = Vec::new();
-    for name in names {
-        for reference in index.find_references(&name) {
-            let key = (
-                reference.location.file.clone(),
-                reference.location.line,
-                reference.location.column,
-                reference.name.clone(),
-            );
-            if seen.insert(key) {
-                refs.push(reference);
-            }
-        }
-    }
-    refs
-}
-
-fn call_endpoint_defs<'a>(
-    index: &'a Index,
-    query: &str,
-    callers: bool,
-    limit: usize,
-) -> Vec<&'a Definition> {
-    let mut names = vec![query.to_string()];
-    if let Some(simple) = simple_name(query) {
-        if simple != query {
-            names.push(simple.to_string());
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut defs = Vec::new();
-    for name in names {
-        let found = if callers {
-            index.find_callers(&name)
-        } else {
-            index.find_callees(&name)
-        };
-        for def in found {
-            if seen.insert(def.qualified_name.clone()) {
-                defs.push(def);
-                if defs.len() >= limit {
-                    return defs;
-                }
-            }
-        }
-    }
-    defs
-}
-
-fn aliases_for_seed(index: &Index, seed: &str) -> Vec<String> {
-    let mut aliases = vec![seed.to_string()];
-    if let Some(simple) = simple_name(seed) {
-        aliases.push(simple.to_string());
-    }
-    for def in index.find_definition(seed) {
-        aliases.push(def.name.clone());
-        aliases.push(def.qualified_name.clone());
-    }
-    aliases.sort();
-    aliases.dedup();
-    aliases
 }
 
 fn matches_any(name: &str, aliases: &HashSet<String>) -> bool {
@@ -912,7 +1361,7 @@ Default database: ./.git/code-indexer/xrefs.sqlite3
 
 Commands:
   index --root PATH [--db index.db] [--language cpp|c] [--threads N] [--references calls|all|none]
-  bench --root PATH [--db index.db] [--no-save] [--threads N] [--references calls|all|none]
+  bench --root PATH [--db index.db|--save] [--no-save] [--threads N] [--references calls|all|none]
   stats [--db index.db]
   find [--db index.db] SYMBOL [--limit N] [--context N] [--include-search]
   search [--db index.db] PATTERN [--limit N] [--context N]
@@ -934,6 +1383,7 @@ LLM workflow examples:
 
 Notes:
   - This is a Tree-sitter structural index, not a compiler oracle.
+  - bench is no-save by default unless --db or --save is provided.
   - Default references mode is calls; use --references all for exhaustive identifier refs.
   - Per-reference source context is disabled during indexing unless --reference-context is set.
   - Exact qualified/simple matches are higher confidence than substring matches.

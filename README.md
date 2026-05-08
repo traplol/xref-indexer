@@ -66,15 +66,18 @@ The default reference mode is `--references calls`, which stores definitions, ca
 
 ## Performance benchmarking
 
-The library exposes `Indexer::index_with_metrics()` and `xref_indexer::benchmark::run(...)` for timed runs. The CLI `bench` command reports discovery, parse, build, SQLite save, row counts, byte counts, lossy-decoded file counts, thread count, and final DB size as JSON.
+The library exposes `Indexer::index_with_metrics()` and `xref_indexer::benchmark::run(...)` for timed runs. The CLI `bench` command reports discovery, parse, build, SQLite save, row counts, byte counts, lossy-decoded file counts, thread count, and final DB size as JSON. `bench` is no-save by default unless `--db` or `--save` is provided.
 
 On the local 10,010-file downloaded C++ corpus in `test-data`, release-mode first-run timing with the default fast reference mode was:
 
 ```text
 files=10010 definitions=629972 calls=847774 refs=827067
-index=9844ms save=6989ms total=16835ms
-hyperfine wall-clock: 17.932s
+index=9747ms save=6984ms total=16732ms
 ```
+
+The high-level CLI lookup commands query SQLite directly instead of hydrating the full index into memory per invocation. On the same 302 MB large index DB, representative release-mode query timings were `find` 3 ms, `refs` 3 ms, `callers` 3 ms, `callees` 5 ms, `search` 7 ms, `hierarchy` 24 ms, `stats` 34 ms, and `expand --depth 2 --limit 20` 124 ms.
+
+For the leanest first run, `--references none` keeps `call_graph` but skips the duplicate call-site `refs` rows; on the same corpus that mode measured `total=13442ms`.
 
 ## SQLite schema
 
