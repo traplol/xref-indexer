@@ -73,6 +73,8 @@ The default reference mode is `--references none`, which stores definitions, cal
 
 The `xref-mcp` binary exposes the same LLM-first lookup flow as a stdio MCP server. It uses the same default database location, `./.git/code-indexer/xrefs.sqlite3`, and query tools run the same auto-reindex check as the CLI unless `no_reindex` is set.
 
+See [docs/mcp.md](docs/mcp.md) for setup, tool arguments, and example calls.
+
 ```sh
 cargo build --release --bin xref-mcp
 ```
