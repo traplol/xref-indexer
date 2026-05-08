@@ -839,7 +839,7 @@ fn checksum_file(
     let source = match change {
         FileChange::Unchanged => None,
         FileChange::Modified | FileChange::New => {
-            Some(decode_source_lossy(&path, bytes, checksum.clone()))
+            Some(decode_source_lossy(bytes, checksum.clone()))
         }
     };
 
@@ -1307,10 +1307,10 @@ fn read_source_lossy(path: &std::path::Path) -> Result<SourceFile, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let checksum = crate::db_impl::checksum_bytes(&bytes);
-    Ok(decode_source_lossy(path, bytes, checksum))
+    Ok(decode_source_lossy(bytes, checksum))
 }
 
-fn decode_source_lossy(path: &std::path::Path, bytes: Vec<u8>, checksum: String) -> SourceFile {
+fn decode_source_lossy(bytes: Vec<u8>, checksum: String) -> SourceFile {
     let byte_len = bytes.len();
     match String::from_utf8(bytes) {
         Ok(source) => SourceFile {
@@ -1319,18 +1319,12 @@ fn decode_source_lossy(path: &std::path::Path, bytes: Vec<u8>, checksum: String)
             checksum,
             decoded_lossy: false,
         },
-        Err(err) => {
-            eprintln!(
-                "Warning: decoded {} with replacement characters because it is not valid UTF-8",
-                path.display()
-            );
-            SourceFile {
-                source: String::from_utf8_lossy(&err.into_bytes()).into_owned(),
-                bytes: byte_len,
-                checksum,
-                decoded_lossy: true,
-            }
-        }
+        Err(err) => SourceFile {
+            source: String::from_utf8_lossy(&err.into_bytes()).into_owned(),
+            bytes: byte_len,
+            checksum,
+            decoded_lossy: true,
+        },
     }
 }
 
