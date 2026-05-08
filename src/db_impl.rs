@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
@@ -28,7 +27,7 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
             column INTEGER NOT NULL,
             end_line INTEGER NOT NULL DEFAULT 0,
             end_column INTEGER NOT NULL DEFAULT 0,
-            parent_id INTEGER REFERENCES definitions(id),
+            parent_name TEXT,
             signature TEXT,
             visibility TEXT NOT NULL DEFAULT 'public',
             is_definition INTEGER NOT NULL DEFAULT 1,
@@ -79,10 +78,40 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(derived_id);
         CREATE INDEX IF NOT EXISTS idx_inheritance_base ON inheritance(base_id);
         ",
-    )
+    )?;
+    ensure_parent_name_column(conn)
+}
+
+fn ensure_parent_name_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(definitions)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_parent_name = false;
+    for column in columns {
+        if column? == "parent_name" {
+            has_parent_name = true;
+            break;
+        }
+    }
+    if !has_parent_name {
+        conn.execute_batch("ALTER TABLE definitions ADD COLUMN parent_name TEXT;")?;
+    }
+    Ok(())
+}
+
+fn resolve_db_definition_id(
+    qname_to_db_id: &std::collections::HashMap<&str, i64>,
+    name_to_db_ids: &std::collections::HashMap<&str, Vec<i64>>,
+    name: &str,
+) -> Option<i64> {
+    qname_to_db_id.get(name).copied().or_else(|| {
+        name_to_db_ids
+            .get(name)
+            .and_then(|ids| (ids.len() == 1).then_some(ids[0]))
+    })
 }
 
 /// Persist an [Index] to a SQLite database at `path`.
+/// Replaces any existing data in the database.
 /// Returns the [Connection] so callers can run further queries.
 pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
@@ -93,31 +122,33 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
 
     let tx = conn.unchecked_transaction()?;
 
-    // Deduplicate and insert files.
+    // Clear existing data so repeated saves don't duplicate rows.
+    tx.execute_batch(
+        "DELETE FROM inheritance; DELETE FROM call_graph; DELETE FROM refs; DELETE FROM definitions; DELETE FROM files;",
+    )?;
+
+    // Insert files from the index's first-class file collection.
     let mut file_ids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO files (path, language) VALUES (?1, ?2) ON CONFLICT(path) DO UPDATE SET language=excluded.language",
-        )?;
-        let mut files: HashSet<(&str, &str)> = HashSet::new();
-        for d in index.definitions() {
-            files.insert((d.location.file.to_str().unwrap_or(""), "c"));
-        }
-        for r in index.references() {
-            files.insert((r.location.file.to_str().unwrap_or(""), "c"));
-        }
-        for (path_str, lang) in &files {
-            stmt.execute(params![path_str, lang])?;
-            let id = tx.last_insert_rowid();
+        let mut insert_stmt =
+            tx.prepare("INSERT OR IGNORE INTO files (path, language) VALUES (?1, ?2)")?;
+        let mut select_stmt = tx.prepare("SELECT id FROM files WHERE path = ?1")?;
+        for f in index.files() {
+            let path_str = f.path.to_str().unwrap_or("");
+            insert_stmt.execute(params![path_str, f.language.as_str()])?;
+            let id: i64 = select_stmt.query_row(params![path_str], |row| row.get(0))?;
             file_ids.insert(path_str.to_string(), id);
         }
     }
 
-    // Insert definitions; build a map from in-memory index → DB id.
+    // Insert definitions; build maps for later resolution.
     let mut def_id_map: Vec<i64> = Vec::with_capacity(index.definitions().len());
+    let mut qname_to_db_id: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    let mut name_to_db_ids: std::collections::HashMap<&str, Vec<i64>> =
+        std::collections::HashMap::new();
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO definitions (name, qualified_name, kind, file_id, line, column, end_line, end_column, parent_id, signature, visibility, is_definition, extra) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO definitions (name, qualified_name, kind, file_id, line, column, end_line, end_column, parent_name, signature, visibility, is_definition, extra) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         )?;
         for d in index.definitions() {
             let file_id = d
@@ -141,11 +172,14 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
                 d.is_definition as i64,
                 d.extra,
             ])?;
-            def_id_map.push(tx.last_insert_rowid());
+            let db_id = tx.last_insert_rowid();
+            def_id_map.push(db_id);
+            qname_to_db_id.insert(&d.qualified_name, db_id);
+            name_to_db_ids.entry(&d.name).or_default().push(db_id);
         }
     }
 
-    // Insert references, remapping def_id from in-memory index to DB id.
+    // Insert references, remapping def_id from in-memory DefId to DB row id.
     {
         let mut stmt = tx.prepare(
             "INSERT INTO refs (name, kind, file_id, line, column, def_id, context) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -159,7 +193,7 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
                 .copied();
             let db_def_id = r
                 .def_id
-                .and_then(|idx| def_id_map.get(idx as usize))
+                .and_then(|def_id| def_id_map.get(def_id.0))
                 .copied();
             stmt.execute(params![
                 r.name,
@@ -173,10 +207,10 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
         }
     }
 
-    // Insert call graph.
+    // Insert call graph with resolved IDs.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO call_graph (caller_name, callee_name, file_id, line, column) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO call_graph (caller_id, callee_id, caller_name, callee_name, file_id, line, column) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         )?;
         for call in index.calls() {
             let file_id = call
@@ -185,7 +219,13 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
                 .to_str()
                 .and_then(|p| file_ids.get(p))
                 .copied();
+            let caller_id =
+                resolve_db_definition_id(&qname_to_db_id, &name_to_db_ids, &call.caller_name);
+            let callee_id =
+                resolve_db_definition_id(&qname_to_db_id, &name_to_db_ids, &call.callee_name);
             stmt.execute(params![
+                caller_id,
+                callee_id,
                 call.caller_name,
                 call.callee_name,
                 file_id,
@@ -195,13 +235,19 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
         }
     }
 
-    // Insert inheritance.
+    // Insert inheritance with resolved IDs.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO inheritance (derived_name, base_name, access, is_virtual) VALUES (?1,?2,?3,?4)",
+            "INSERT INTO inheritance (derived_id, base_id, derived_name, base_name, access, is_virtual) VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
         for inh in index.inherits() {
+            let derived_id =
+                resolve_db_definition_id(&qname_to_db_id, &name_to_db_ids, &inh.derived_name);
+            let base_id =
+                resolve_db_definition_id(&qname_to_db_id, &name_to_db_ids, &inh.base_name);
             stmt.execute(params![
+                derived_id,
+                base_id,
                 inh.derived_name,
                 inh.base_name,
                 inh.access.as_str(),
@@ -209,16 +255,6 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
             ])?;
         }
     }
-
-    // Resolve caller_id/callee_id via qualified name lookup.
-    tx.execute_batch(
-        "
-        UPDATE call_graph SET caller_id = (SELECT id FROM definitions WHERE qualified_name = call_graph.caller_name LIMIT 1);
-        UPDATE call_graph SET callee_id = (SELECT id FROM definitions WHERE qualified_name = call_graph.callee_name LIMIT 1);
-        UPDATE inheritance SET derived_id = (SELECT id FROM definitions WHERE qualified_name = inheritance.derived_name LIMIT 1);
-        UPDATE inheritance SET base_id = (SELECT id FROM definitions WHERE qualified_name = inheritance.base_name LIMIT 1);
-        ",
-    )?;
 
     tx.commit()?;
     // Re-enable foreign keys for future queries.
@@ -230,20 +266,54 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
 /// Returns both the [Index] and the [Connection] for further queries.
 pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
     let conn = Connection::open(path)?;
+    create_schema(&conn)?;
+
+    // Preload all files; build both the lookup map and the IndexedFile collection.
+    let file_map: std::collections::HashMap<i64, PathBuf> = {
+        let mut stmt = conn.prepare("SELECT id, path, language FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                std::path::PathBuf::from(row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (id, path, _lang) = r?;
+            map.insert(id, path);
+        }
+        map
+    };
+
+    let index_files: Vec<IndexedFile> = {
+        let mut stmt = conn.prepare("SELECT path, language FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(IndexedFile {
+                path: std::path::PathBuf::from(row.get::<_, String>(0)?),
+                language: row.get(1)?,
+            })
+        })?;
+        let mut files = Vec::new();
+        for f in rows {
+            files.push(f?);
+        }
+        files
+    };
+
+    let resolve_file = |file_id: Option<i64>| -> PathBuf {
+        file_id
+            .and_then(|fid| file_map.get(&fid).cloned())
+            .unwrap_or_default()
+    };
 
     let mut definitions: Vec<Definition> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, name, qualified_name, kind, line, column, end_line, end_column, parent_id, signature, visibility, is_definition, extra, file_id FROM definitions",
+            "SELECT id, name, qualified_name, kind, line, column, end_line, end_column, parent_name, signature, visibility, is_definition, extra, file_id FROM definitions",
         )?;
         let rows = stmt.query_map([], |row| {
             let file_id: Option<i64> = row.get(13)?;
-            let file_path = file_id.and_then(|fid| {
-                conn.query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-            });
             Ok(Definition {
                 id: Some(row.get(0)?),
                 name: row.get(1)?,
@@ -251,7 +321,7 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
                 kind: SymbolKind::from_str(&row.get::<_, String>(3)?)
                     .unwrap_or(SymbolKind::Function),
                 location: Location {
-                    file: file_path.map(std::path::PathBuf::from).unwrap_or_default(),
+                    file: resolve_file(file_id),
                     line: row.get::<_, i64>(4)? as usize,
                     column: row.get::<_, i64>(5)? as usize,
                     end_line: row.get::<_, i64>(6)? as usize,
@@ -270,31 +340,33 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
         }
     }
 
+    // Build a map from DB definition ID → position in the definitions vector.
+    let db_id_to_pos: std::collections::HashMap<i64, usize> = definitions
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, d)| d.id.map(|db_id| (db_id, pos)))
+        .collect();
+
     let mut references: Vec<Reference> = Vec::new();
     {
         let mut stmt = conn
             .prepare("SELECT id, name, kind, line, column, def_id, context, file_id FROM refs")?;
         let rows = stmt.query_map([], |row| {
             let file_id: Option<i64> = row.get(7)?;
-            let file_path = file_id.and_then(|fid| {
-                conn.query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-            });
+            let db_def_id: Option<i64> = row.get(5)?;
             Ok(Reference {
                 id: Some(row.get(0)?),
                 name: row.get(1)?,
                 kind: SymbolKind::from_str(&row.get::<_, String>(2)?)
                     .unwrap_or(SymbolKind::Function),
                 location: Location {
-                    file: file_path.map(std::path::PathBuf::from).unwrap_or_default(),
+                    file: resolve_file(file_id),
                     line: row.get::<_, i64>(3)? as usize,
                     column: row.get::<_, i64>(4)? as usize,
                     end_line: 0,
                     end_column: 0,
                 },
-                def_id: row.get(5)?,
+                def_id: db_def_id.and_then(|db_id| db_id_to_pos.get(&db_id).map(|&pos| DefId(pos))),
                 context: row.get(6)?,
             })
         })?;
@@ -309,17 +381,11 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
             conn.prepare("SELECT caller_name, callee_name, line, column, file_id FROM call_graph")?;
         let rows = stmt.query_map([], |row| {
             let file_id: Option<i64> = row.get(4)?;
-            let file_path = file_id.and_then(|fid| {
-                conn.query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-            });
             Ok(CallEdge {
                 caller_name: row.get(0)?,
                 callee_name: row.get(1)?,
                 location: Location {
-                    file: file_path.map(std::path::PathBuf::from).unwrap_or_default(),
+                    file: resolve_file(file_id),
                     line: row.get::<_, i64>(2)? as usize,
                     column: row.get::<_, i64>(3)? as usize,
                     end_line: 0,
@@ -350,5 +416,8 @@ pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
         }
     }
 
-    Ok((Index::new(definitions, references, calls, inherits), conn))
+    Ok((
+        Index::new(index_files, definitions, references, calls, inherits),
+        conn,
+    ))
 }

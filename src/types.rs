@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 
+/// Stable in-memory identifier for a definition.
+/// Maps to a position in the definitions vector.
+/// Consumers should treat it as opaque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DefId(pub usize);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Location {
     pub file: PathBuf,
@@ -111,7 +117,7 @@ pub struct Reference {
     pub name: String,
     pub kind: SymbolKind,
     pub location: Location,
-    pub def_id: Option<i64>,
+    pub def_id: Option<DefId>,
     pub context: Option<String>,
 }
 
@@ -128,6 +134,13 @@ pub struct InheritEdge {
     pub base_name: String,
     pub access: Visibility,
     pub is_virtual: bool,
+}
+
+/// Metadata about an indexed file.
+#[derive(Debug, Clone)]
+pub struct IndexedFile {
+    pub path: PathBuf,
+    pub language: String,
 }
 
 #[derive(Debug, Clone)]
