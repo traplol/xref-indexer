@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use xref_indexer::types::{SymbolKind, Visibility};
-use xref_indexer::{Indexer, Language};
+use xref_indexer::{Indexer, Language, ReferenceMode};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -11,6 +11,7 @@ fn fixture_index() -> xref_indexer::Index {
     Indexer::builder()
         .add_directory(fixtures_dir())
         .language(Language::Cpp)
+        .reference_mode(ReferenceMode::All)
         .build()
         .index()
         .expect("indexing should succeed")
@@ -21,6 +22,7 @@ fn test_index_cpp_fixtures() {
     let indexer = Indexer::builder()
         .add_directory(fixtures_dir())
         .language(Language::Cpp)
+        .reference_mode(ReferenceMode::All)
         .build();
 
     let index = indexer.index().expect("indexing should succeed");
@@ -133,6 +135,7 @@ fn test_search_symbols() {
     let indexer = Indexer::builder()
         .add_directory(fixtures_dir())
         .language(Language::Cpp)
+        .reference_mode(ReferenceMode::All)
         .build();
 
     let index = indexer.index().expect("indexing should succeed");
@@ -146,6 +149,47 @@ fn test_search_symbols() {
 
     let results = index.search_symbols("nonexistent_xyzzy");
     assert!(results.is_empty());
+}
+
+#[test]
+fn test_indexer_decodes_invalid_utf8_lossily() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "xref-indexer-invalid-utf8-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp fixture dir");
+    std::fs::write(
+        root.join("invalid.cpp"),
+        b"int valid_symbol() { return 1; }\n// legacy byte: \xFF\nint caller() { return valid_symbol(); }\n",
+    )
+    .expect("write invalid UTF-8 fixture");
+
+    let index = Indexer::builder()
+        .add_directory(&root)
+        .language(Language::Cpp)
+        .build()
+        .index()
+        .expect("indexing should tolerate invalid UTF-8");
+
+    let def_names: Vec<_> = index
+        .definitions()
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    assert!(
+        def_names.contains(&"valid_symbol"),
+        "expected valid_symbol definition; got: {def_names:?}"
+    );
+    assert!(
+        def_names.contains(&"caller"),
+        "expected caller definition; got: {def_names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -201,6 +245,49 @@ fn test_call_graph_uses_function_callers_and_keeps_call_references() {
     assert!(
         compute_ref_lines.contains(&15) && compute_ref_lines.contains(&25),
         "expected compute call references on lines 15 and 25; got: {compute_ref_lines:?}"
+    );
+}
+
+#[test]
+fn test_reference_modes_control_reference_volume() {
+    let calls_only = Indexer::builder()
+        .add_directory(fixtures_dir())
+        .language(Language::Cpp)
+        .reference_mode(ReferenceMode::Calls)
+        .build()
+        .index()
+        .expect("calls-only indexing should succeed");
+    let no_refs = Indexer::builder()
+        .add_directory(fixtures_dir())
+        .language(Language::Cpp)
+        .reference_mode(ReferenceMode::None)
+        .build()
+        .index()
+        .expect("no-ref indexing should succeed");
+    let all_refs = fixture_index();
+
+    assert!(
+        calls_only.reference_count() > 0,
+        "calls mode should keep call-site refs"
+    );
+    assert_eq!(
+        no_refs.reference_count(),
+        0,
+        "none mode should suppress refs"
+    );
+    assert!(
+        all_refs.reference_count() > calls_only.reference_count(),
+        "all mode should collect more refs than calls mode"
+    );
+    assert_eq!(
+        all_refs.calls().len(),
+        calls_only.calls().len(),
+        "reference mode should not change call graph edges"
+    );
+    assert_eq!(
+        calls_only.calls().len(),
+        no_refs.calls().len(),
+        "none mode should still collect call graph edges"
     );
 }
 

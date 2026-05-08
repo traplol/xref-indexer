@@ -1,3 +1,4 @@
+pub mod benchmark;
 mod cpp_parser;
 mod index;
 mod parser;
@@ -15,8 +16,12 @@ pub mod query {
     pub use crate::index::ClassHierarchy;
 }
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use serde::Serialize;
 use walkdir::WalkDir;
 
 pub use crate::index::Index;
@@ -24,6 +29,43 @@ pub use crate::index::Index;
 use crate::cpp_parser::CppParser;
 use crate::index::IndexBuilder;
 use crate::parser::Parser;
+
+const INDEXER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Timings and counts from one indexing pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexMetrics {
+    pub threads: usize,
+    pub files_discovered: usize,
+    pub files_indexed: usize,
+    pub bytes_read: u64,
+    pub lossy_decoded_files: usize,
+    pub definitions: usize,
+    pub references: usize,
+    pub calls: usize,
+    pub inheritance_edges: usize,
+    pub discover_ms: u128,
+    pub parse_ms: u128,
+    pub build_ms: u128,
+    pub total_ms: u128,
+}
+
+/// Result of an indexing pass with timing data.
+pub struct IndexedRun {
+    pub index: Index,
+    pub metrics: IndexMetrics,
+}
+
+/// How much reference data to collect in addition to definitions and call edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ReferenceMode {
+    /// Do not populate the refs table. Call graph edges are still collected.
+    None,
+    /// Populate refs for call targets only. This is the default fast mode.
+    Calls,
+    /// Populate refs for all identifier-like Tree-sitter nodes.
+    All,
+}
 
 /// Supported languages for indexing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +75,20 @@ pub enum Language {
 }
 
 impl Language {
-    fn parser(&self) -> Box<dyn Parser> {
+    fn parser(
+        &self,
+        reference_mode: ReferenceMode,
+        include_reference_context: bool,
+    ) -> Box<dyn Parser> {
         match self {
-            Language::C => Box::new(CppParser::new_c()),
-            Language::Cpp => Box::new(CppParser::new_cpp()),
+            Language::C => Box::new(CppParser::new_c_with_options(
+                reference_mode,
+                include_reference_context,
+            )),
+            Language::Cpp => Box::new(CppParser::new_cpp_with_options(
+                reference_mode,
+                include_reference_context,
+            )),
         }
     }
 
@@ -55,6 +107,9 @@ pub struct IndexerBuilder {
     paths: Vec<PathBuf>,
     language: Language,
     follow_symlinks: bool,
+    threads: Option<usize>,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
 }
 
 impl IndexerBuilder {
@@ -63,6 +118,9 @@ impl IndexerBuilder {
             paths: Vec::new(),
             language: Language::Cpp,
             follow_symlinks: false,
+            threads: None,
+            reference_mode: ReferenceMode::Calls,
+            include_reference_context: false,
         }
     }
 
@@ -84,12 +142,36 @@ impl IndexerBuilder {
         self
     }
 
+    /// Set the number of parser worker threads. `0` means use the default.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = (threads > 0).then_some(threads);
+        self
+    }
+
+    /// Store source-line context on every reference.
+    ///
+    /// This is disabled by default because snippets can be fetched lazily and
+    /// large codebases can contain millions of references.
+    pub fn reference_context(mut self, include: bool) -> Self {
+        self.include_reference_context = include;
+        self
+    }
+
+    /// Set how much reference data to collect.
+    pub fn reference_mode(mut self, mode: ReferenceMode) -> Self {
+        self.reference_mode = mode;
+        self
+    }
+
     /// Build the [Indexer].
     pub fn build(self) -> Indexer {
         Indexer {
             paths: self.paths,
             language: self.language,
             follow_symlinks: self.follow_symlinks,
+            threads: self.threads,
+            reference_mode: self.reference_mode,
+            include_reference_context: self.include_reference_context,
         }
     }
 }
@@ -99,6 +181,9 @@ pub struct Indexer {
     paths: Vec<PathBuf>,
     language: Language,
     follow_symlinks: bool,
+    threads: Option<usize>,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
 }
 
 impl Indexer {
@@ -109,68 +194,318 @@ impl Indexer {
 
     /// Run the indexer over the configured paths. Returns an in-memory [Index].
     pub fn index(&self) -> Result<Index, String> {
-        let parser = self.language.parser();
-        let extensions = self.language.extensions();
-        let mut builder = IndexBuilder::new();
-        let mut files_indexed = 0usize;
+        Ok(self.index_with_metrics()?.index)
+    }
 
-        for root in &self.paths {
-            let walker = WalkDir::new(root)
-                .follow_links(self.follow_symlinks)
-                .into_iter()
-                .filter_entry(|e| {
-                    // Skip hidden directories and common build dirs.
-                    let name = e.file_name().to_str().unwrap_or("");
-                    if name.starts_with('.') && name != "." && name != ".." {
-                        return false;
-                    }
-                    if e.file_type().is_dir() {
-                        let skip_dirs = [
-                            "build",
-                            "cmake-build-debug",
-                            "cmake-build-release",
-                            "bazel-bin",
-                            "bazel-out",
-                            "bazel-testlogs",
-                            "node_modules",
-                            "third_party",
-                            "third-party",
-                            ".git",
-                        ];
-                        return !skip_dirs.contains(&name);
-                    }
-                    true
-                });
+    /// Run the indexer and return phase timings alongside the in-memory [Index].
+    pub fn index_with_metrics(&self) -> Result<IndexedRun, String> {
+        let paths = self.paths.clone();
+        let language = self.language;
+        let follow_symlinks = self.follow_symlinks;
+        let threads = self.threads;
+        let reference_mode = self.reference_mode;
+        let include_reference_context = self.include_reference_context;
 
-            for entry in walker {
-                let entry = entry.map_err(|e| format!("walk error: {e}"))?;
-                let path = entry.path();
+        std::thread::Builder::new()
+            .name("xref-indexer".to_string())
+            .stack_size(INDEXER_STACK_SIZE)
+            .spawn(move || {
+                index_paths(
+                    paths,
+                    language,
+                    follow_symlinks,
+                    threads,
+                    reference_mode,
+                    include_reference_context,
+                )
+            })
+            .map_err(|e| format!("failed to start indexer thread: {e}"))?
+            .join()
+            .map_err(|_| "indexer thread panicked".to_string())?
+    }
+}
 
-                if !path.is_file() {
-                    continue;
-                }
+fn index_paths(
+    paths: Vec<PathBuf>,
+    language: Language,
+    follow_symlinks: bool,
+    threads: Option<usize>,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+) -> Result<IndexedRun, String> {
+    let total_start = Instant::now();
+    let discover_start = Instant::now();
+    let files = discover_files(&paths, language, follow_symlinks)?;
+    let discover_ms = discover_start.elapsed().as_millis();
+    let files_discovered = files.len();
+    let worker_count = worker_count(threads, files_discovered);
 
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
+    let parse_start = Instant::now();
+    let parsed = parse_files(
+        files,
+        language,
+        worker_count,
+        reference_mode,
+        include_reference_context,
+    )?;
+    let parse_ms = parse_start.elapsed().as_millis();
 
-                if !extensions.contains(&ext.as_str()) {
-                    continue;
-                }
+    let files_indexed = parsed.files.len();
+    let bytes_read = parsed.bytes_read;
+    let lossy_decoded_files = parsed.lossy_decoded_files;
+    let definitions = parsed
+        .files
+        .iter()
+        .map(|f| f.symbols.definitions.len())
+        .sum();
+    let references = parsed
+        .files
+        .iter()
+        .map(|f| f.symbols.references.len())
+        .sum();
+    let calls = parsed.files.iter().map(|f| f.symbols.calls.len()).sum();
+    let inheritance_edges = parsed.files.iter().map(|f| f.symbols.inherits.len()).sum();
 
-                let source = std::fs::read_to_string(path)
-                    .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let build_start = Instant::now();
+    let mut builder = IndexBuilder::with_capacity(
+        files_indexed,
+        definitions,
+        references,
+        calls,
+        inheritance_edges,
+    );
+    for file in parsed.files {
+        builder.add_file(file.symbols);
+    }
+    let index = builder.build();
+    let build_ms = build_start.elapsed().as_millis();
 
-                let symbols = parser.parse_file(path, &source)?;
-                builder.add_file(symbols);
-                files_indexed += 1;
+    let metrics = IndexMetrics {
+        threads: worker_count,
+        files_discovered,
+        files_indexed,
+        bytes_read,
+        lossy_decoded_files,
+        definitions: index.definition_count(),
+        references: index.reference_count(),
+        calls: index.calls().len(),
+        inheritance_edges: index.inherits().len(),
+        discover_ms,
+        parse_ms,
+        build_ms,
+        total_ms: total_start.elapsed().as_millis(),
+    };
+
+    eprintln!(
+        "Indexed {} files in {} ms (discover {} ms, parse {} ms, build {} ms, threads {})",
+        metrics.files_indexed,
+        metrics.total_ms,
+        metrics.discover_ms,
+        metrics.parse_ms,
+        metrics.build_ms,
+        metrics.threads
+    );
+    Ok(IndexedRun { index, metrics })
+}
+
+fn discover_files(
+    paths: &[PathBuf],
+    language: Language,
+    follow_symlinks: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let extensions = language.extensions();
+    let mut files = Vec::new();
+
+    for root in paths {
+        let walker = WalkDir::new(root)
+            .follow_links(follow_symlinks)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_str().unwrap_or("");
+                !should_skip_entry(name, e.file_type().is_dir())
+            });
+
+        for entry in walker {
+            let entry = entry.map_err(|e| format!("walk error: {e}"))?;
+            let path = entry.path();
+
+            if !path.is_file() {
+                continue;
             }
+
+            if !is_supported_extension(path, extensions) {
+                continue;
+            }
+
+            files.push(path.to_path_buf());
+        }
+    }
+
+    Ok(files)
+}
+
+fn worker_count(requested: Option<usize>, files: usize) -> usize {
+    let default = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    requested.unwrap_or(default).max(1).min(files.max(1))
+}
+
+#[derive(Default)]
+struct ParsedFiles {
+    files: Vec<ParsedFile>,
+    bytes_read: u64,
+    lossy_decoded_files: usize,
+}
+
+struct ParsedFile {
+    index: usize,
+    symbols: crate::types::FileSymbols,
+}
+
+struct SourceFile {
+    source: String,
+    bytes: usize,
+    decoded_lossy: bool,
+}
+
+fn parse_files(
+    files: Vec<PathBuf>,
+    language: Language,
+    threads: usize,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+) -> Result<ParsedFiles, String> {
+    if files.is_empty() {
+        return Ok(ParsedFiles::default());
+    }
+
+    let queue: Arc<Mutex<VecDeque<(usize, PathBuf)>>> =
+        Arc::new(Mutex::new(files.into_iter().enumerate().collect()));
+
+    let mut batches = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for worker_id in 0..threads {
+            let queue = Arc::clone(&queue);
+            let handle = std::thread::Builder::new()
+                .name(format!("xref-indexer-worker-{worker_id}"))
+                .stack_size(INDEXER_STACK_SIZE)
+                .spawn_scoped(scope, move || {
+                    parse_worker(queue, language, reference_mode, include_reference_context)
+                })
+                .map_err(|e| format!("failed to start parser worker: {e}"))?;
+            handles.push(handle);
         }
 
-        eprintln!("Indexed {files_indexed} files");
-        Ok(builder.build())
+        let mut batches = Vec::with_capacity(threads);
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(batch)) => batches.push(batch),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("parser worker panicked".to_string()),
+            }
+        }
+        Ok(batches)
+    })?;
+
+    let total_files = batches.iter().map(|batch| batch.files.len()).sum();
+    let mut parsed = ParsedFiles {
+        files: Vec::with_capacity(total_files),
+        bytes_read: batches.iter().map(|batch| batch.bytes_read).sum(),
+        lossy_decoded_files: batches.iter().map(|batch| batch.lossy_decoded_files).sum(),
+    };
+
+    for batch in batches.drain(..) {
+        parsed.files.extend(batch.files);
+    }
+    parsed.files.sort_by_key(|file| file.index);
+    Ok(parsed)
+}
+
+fn parse_worker(
+    queue: Arc<Mutex<VecDeque<(usize, PathBuf)>>>,
+    language: Language,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
+) -> Result<ParsedFiles, String> {
+    let mut parser = language.parser(reference_mode, include_reference_context);
+    let mut parsed = ParsedFiles::default();
+
+    loop {
+        let Some((index, path)) = queue
+            .lock()
+            .map_err(|_| "parser queue mutex poisoned".to_string())?
+            .pop_front()
+        else {
+            break;
+        };
+
+        let source = read_source_lossy(&path)?;
+        parsed.bytes_read += source.bytes as u64;
+        parsed.lossy_decoded_files += usize::from(source.decoded_lossy);
+        let symbols = parser
+            .parse_file(&path, &source.source)
+            .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+        parsed.files.push(ParsedFile { index, symbols });
+    }
+
+    Ok(parsed)
+}
+
+fn should_skip_entry(name: &str, is_dir: bool) -> bool {
+    if name.starts_with('.') && name != "." && name != ".." {
+        return true;
+    }
+    if !is_dir {
+        return false;
+    }
+    matches!(
+        name,
+        "build"
+            | "cmake-build-debug"
+            | "cmake-build-release"
+            | "bazel-bin"
+            | "bazel-out"
+            | "bazel-testlogs"
+            | "node_modules"
+            | "third_party"
+            | "third-party"
+            | ".git"
+    )
+}
+
+fn is_supported_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            extensions
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
+        .unwrap_or(false)
+}
+
+fn read_source_lossy(path: &std::path::Path) -> Result<SourceFile, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let byte_len = bytes.len();
+    match String::from_utf8(bytes) {
+        Ok(source) => Ok(SourceFile {
+            source,
+            bytes: byte_len,
+            decoded_lossy: false,
+        }),
+        Err(err) => {
+            eprintln!(
+                "Warning: decoded {} with replacement characters because it is not valid UTF-8",
+                path.display()
+            );
+            Ok(SourceFile {
+                source: String::from_utf8_lossy(err.as_bytes()).into_owned(),
+                bytes: byte_len,
+                decoded_lossy: true,
+            })
+        }
     }
 }
 

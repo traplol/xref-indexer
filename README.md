@@ -26,6 +26,56 @@ let callers = index.find_callers("helper");
 let hierarchy = index.class_hierarchy("Base");
 ```
 
+## CLI for LLM agents
+
+The default binary is an LLM-first CLI: every command returns JSON and most lookup commands can include source snippets, so an agent can avoid separate `grep`/`find`/`sed -n` calls.
+
+By default the CLI reads and writes:
+
+```text
+./.git/code-indexer/xrefs.sqlite3
+```
+
+Use `--db PATH` to override that location.
+
+```sh
+# Build an index at ./.git/code-indexer/xrefs.sqlite3.
+cargo run --release -- index --root tests/fixtures --language cpp
+
+# Benchmark a full first run with phase timings.
+cargo run --release -- bench --root test-data --db /tmp/xrefs-bench.sqlite3 --pretty
+
+# Find exact definition candidates, with context.
+cargo run --release -- find demo::Derived::run --pretty
+
+# Walk xrefs without globbing through unrelated files.
+cargo run --release -- callers compute --pretty
+cargo run --release -- callees demo::Derived::run --pretty
+cargo run --release -- expand compute --direction callers --depth 2 --pretty
+
+# Fetch source context directly.
+cargo run --release -- context --file tests/fixtures/demo.cpp --line 15 --context 4 --pretty
+
+# Query the SQLite DB when a custom join is easier.
+cargo run --release -- sql --sql "SELECT name, qualified_name, kind FROM definitions LIMIT 10" --pretty
+```
+
+The CLI reports confidence/provenance-style fields such as `exact_qualified`, `exact_simple`, `substring`, `resolved_unique_name`, and `structural_call`. The index is Tree-sitter based, so treat results as fast structural candidates rather than compiler-perfect C++ semantic facts.
+
+The default reference mode is `--references calls`, which stores definitions, call graph edges, and call-site refs. Use `--references all` for exhaustive identifier refs, or `--references none` when the call graph table is enough. Per-reference source-line context is disabled by default; use `context`/snippets for lazy source text, or pass `--reference-context` for the heavier legacy behavior.
+
+## Performance benchmarking
+
+The library exposes `Indexer::index_with_metrics()` and `xref_indexer::benchmark::run(...)` for timed runs. The CLI `bench` command reports discovery, parse, build, SQLite save, row counts, byte counts, lossy-decoded file counts, thread count, and final DB size as JSON.
+
+On the local 10,010-file downloaded C++ corpus in `test-data`, release-mode first-run timing with the default fast reference mode was:
+
+```text
+files=10010 definitions=629972 calls=847774 refs=827067
+index=9844ms save=6989ms total=16835ms
+hyperfine wall-clock: 17.932s
+```
+
 ## SQLite schema
 
 The database is designed so an LLM can join tables and explore the codebase without writing Rust code.
@@ -51,14 +101,15 @@ CREATE TABLE definitions (
     column INTEGER NOT NULL,
     end_line INTEGER,
     end_column INTEGER,
-    parent_id INTEGER REFERENCES definitions(id),
-    signature TEXT,                 -- full function/method signature
+    parent_name TEXT,
+    signature TEXT,                 -- function/method declaration header
     visibility TEXT DEFAULT 'public',
     is_definition INTEGER DEFAULT 1,
     extra TEXT                      -- JSON for language-specific data
 );
 
--- Every reference (use of a symbol).
+-- Symbol references. Default mode stores call-site refs; --references all stores
+-- exhaustive identifier-like refs.
 CREATE TABLE refs (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -67,7 +118,7 @@ CREATE TABLE refs (
     line INTEGER NOT NULL,
     column INTEGER NOT NULL,
     def_id INTEGER REFERENCES definitions(id),  -- resolved definition, NULL if ambiguous
-    context TEXT                                 -- source line containing the reference
+    context TEXT                                 -- optional; only set with --reference-context
 );
 
 -- Who calls whom.

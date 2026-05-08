@@ -1,12 +1,13 @@
+use serde::Serialize;
 use std::path::PathBuf;
 
 /// Stable in-memory identifier for a definition.
 /// Maps to a position in the definitions vector.
 /// Consumers should treat it as opaque.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct DefId(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Location {
     pub file: PathBuf,
     pub line: usize,
@@ -15,7 +16,7 @@ pub struct Location {
     pub end_column: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum SymbolKind {
     Function,
     Method,
@@ -71,7 +72,7 @@ impl SymbolKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Visibility {
     Public,
     Protected,
@@ -97,7 +98,7 @@ impl Visibility {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Definition {
     pub id: Option<i64>,
     pub name: String,
@@ -111,7 +112,7 @@ pub struct Definition {
     pub extra: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Reference {
     pub id: Option<i64>,
     pub name: String,
@@ -121,14 +122,14 @@ pub struct Reference {
     pub context: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CallEdge {
     pub caller_name: String,
     pub callee_name: String,
     pub location: Location,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InheritEdge {
     pub derived_name: String,
     pub base_name: String,
@@ -137,7 +138,7 @@ pub struct InheritEdge {
 }
 
 /// Metadata about an indexed file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexedFile {
     pub path: PathBuf,
     pub language: String,

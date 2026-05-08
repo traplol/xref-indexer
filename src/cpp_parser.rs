@@ -5,50 +5,86 @@ use tree_sitter::{Language, Node, Parser as TsParser, Point};
 
 use crate::parser::Parser;
 use crate::types::*;
+use crate::ReferenceMode;
+
+const MAX_PARSE_DEPTH: usize = 512;
 
 /// C/C++ parser using tree-sitter.
 pub struct CppParser {
-    ts_language: Language,
+    parser: TsParser,
     language_name: &'static str,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
 }
 
 impl CppParser {
-    pub fn new_c() -> Self {
-        Self {
-            ts_language: tree_sitter_c::LANGUAGE.into(),
-            language_name: "c",
-        }
+    pub fn new_c_with_options(
+        reference_mode: ReferenceMode,
+        include_reference_context: bool,
+    ) -> Self {
+        Self::new(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            reference_mode,
+            include_reference_context,
+        )
     }
 
-    pub fn new_cpp() -> Self {
+    pub fn new_cpp_with_options(
+        reference_mode: ReferenceMode,
+        include_reference_context: bool,
+    ) -> Self {
+        Self::new(
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            reference_mode,
+            include_reference_context,
+        )
+    }
+
+    fn new(
+        ts_language: Language,
+        language_name: &'static str,
+        reference_mode: ReferenceMode,
+        include_reference_context: bool,
+    ) -> Self {
+        let mut parser = TsParser::new();
+        parser
+            .set_language(&ts_language)
+            .expect("tree-sitter language should be compatible with parser");
         Self {
-            ts_language: tree_sitter_cpp::LANGUAGE.into(),
-            language_name: "cpp",
+            parser,
+            language_name,
+            reference_mode,
+            include_reference_context,
         }
     }
 }
 
 impl Parser for CppParser {
-    fn parse_file(&self, path: &Path, source: &str) -> Result<FileSymbols, String> {
-        let mut parser = TsParser::new();
-        parser
-            .set_language(&self.ts_language)
-            .map_err(|e| format!("failed to set language: {e}"))?;
-
-        let tree = parser
+    fn parse_file(&mut self, path: &Path, source: &str) -> Result<FileSymbols, String> {
+        let tree = self
+            .parser
             .parse(source, None)
             .ok_or_else(|| "parse returned None".to_string())?;
 
-        let mut state = ParseState::new(path, source);
+        let mut state = ParseState::new(
+            path,
+            source,
+            self.reference_mode,
+            self.include_reference_context,
+        );
 
         let root = tree.root_node();
         // Walk first to collect definitions and their name locations.
         state.collect_definitions = true;
-        state.walk_node(root, self.language_name);
+        state.walk_node(root, self.language_name, 0);
 
-        // Second pass: collect references at identifier nodes not in def_locations.
-        state.collect_definitions = false;
-        state.walk_node(root, self.language_name);
+        if self.reference_mode == ReferenceMode::All {
+            // Second pass: collect references at identifier nodes not in def_locations.
+            state.collect_definitions = false;
+            state.walk_node(root, self.language_name, 0);
+        }
 
         Ok(FileSymbols {
             file: path.to_path_buf(),
@@ -78,11 +114,18 @@ struct ParseState<'a> {
     scope_stack: Vec<(String, SymbolKind)>,
     visibility_stack: Vec<Visibility>,
     current_function: Option<String>,
+    reference_mode: ReferenceMode,
+    include_reference_context: bool,
     line_starts: Vec<usize>,
 }
 
 impl<'a> ParseState<'a> {
-    fn new(file: &'a Path, source: &'a str) -> Self {
+    fn new(
+        file: &'a Path,
+        source: &'a str,
+        reference_mode: ReferenceMode,
+        include_reference_context: bool,
+    ) -> Self {
         let mut line_starts = vec![0];
         line_starts.extend(
             source
@@ -104,6 +147,8 @@ impl<'a> ParseState<'a> {
             scope_stack: Vec::new(),
             visibility_stack: Vec::new(),
             current_function: None,
+            reference_mode,
+            include_reference_context,
             line_starts,
         }
     }
@@ -201,7 +246,11 @@ impl<'a> ParseState<'a> {
     }
 
     /// Walk the tree recursively.
-    fn walk_node(&mut self, node: Node<'a>, language: &str) {
+    fn walk_node(&mut self, node: Node<'a>, language: &str, depth: usize) {
+        if depth > MAX_PARSE_DEPTH {
+            return;
+        }
+
         let kind = node.kind();
 
         match kind {
@@ -215,7 +264,7 @@ impl<'a> ParseState<'a> {
                 // Even if no name (anonymous namespace), push a scope.
                 let name = extract_namespace_name(node, self.source).unwrap_or_default();
                 self.push_scope(&name, SymbolKind::Namespace, Visibility::Public);
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 self.pop_scope();
                 return;
             }
@@ -238,7 +287,7 @@ impl<'a> ParseState<'a> {
                     _ => Visibility::Public,
                 };
                 self.push_scope(&name, SymbolKind::Class, default_vis);
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 self.pop_scope();
                 return;
             }
@@ -251,7 +300,7 @@ impl<'a> ParseState<'a> {
                 }
                 let name = extract_typename(node, self.source).unwrap_or_default();
                 self.push_scope(&name, SymbolKind::Enum, Visibility::Public);
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 self.pop_scope();
                 return;
             }
@@ -300,7 +349,7 @@ impl<'a> ParseState<'a> {
                         });
                     }
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 self.current_function = prev_function;
                 return;
             }
@@ -309,7 +358,7 @@ impl<'a> ParseState<'a> {
                 if self.collect_definitions {
                     self.handle_declaration(node, language);
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -317,7 +366,7 @@ impl<'a> ParseState<'a> {
                 if self.collect_definitions {
                     self.handle_declaration(node, language);
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -325,7 +374,7 @@ impl<'a> ParseState<'a> {
                 if self.collect_definitions {
                     self.handle_macro_def(node);
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -350,7 +399,7 @@ impl<'a> ParseState<'a> {
                         });
                     }
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -358,7 +407,7 @@ impl<'a> ParseState<'a> {
                 if self.collect_definitions {
                     self.handle_typedef(node);
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -386,14 +435,14 @@ impl<'a> ParseState<'a> {
                         });
                     }
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
             // ── Template wrappers ──
             "template_declaration" | "template_specification" => {
                 // Walk children — the real declaration is nested inside.
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -402,7 +451,7 @@ impl<'a> ParseState<'a> {
                 if self.collect_definitions {
                     self.handle_inheritance(node);
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
@@ -413,13 +462,13 @@ impl<'a> ParseState<'a> {
                         *last = vis;
                     }
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
             // ── References (second pass) ──
             "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier" => {
-                if !self.collect_definitions {
+                if !self.collect_definitions && self.reference_mode == ReferenceMode::All {
                     self.handle_reference(node);
                 }
                 // Don't recurse — identifiers are leaves.
@@ -428,23 +477,27 @@ impl<'a> ParseState<'a> {
 
             // ── Call expressions ──
             "call_expression" => {
-                if !self.collect_definitions {
+                if !self.collect_definitions || self.reference_mode != ReferenceMode::All {
                     self.handle_call(node);
                 }
-                self.walk_children(node, language);
+                self.walk_children(node, language, depth);
                 return;
             }
 
             _ => {}
         }
 
-        self.walk_children(node, language);
+        self.walk_children(node, language, depth);
     }
 
-    fn walk_children(&mut self, node: Node<'a>, language: &str) {
+    fn walk_children(&mut self, node: Node<'a>, language: &str, depth: usize) {
+        if depth >= MAX_PARSE_DEPTH {
+            return;
+        }
+
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
-                self.walk_node(child, language);
+                self.walk_node(child, language, depth + 1);
             }
         }
     }
@@ -623,7 +676,7 @@ impl<'a> ParseState<'a> {
         if name.is_empty() || name.len() > 256 {
             return;
         }
-        let context = self.line_context(loc.line);
+        let context = self.reference_context(loc.line);
         self.references.push(Reference {
             id: None,
             name,
@@ -665,11 +718,15 @@ impl<'a> ParseState<'a> {
                 location: callee_loc.clone(),
             });
 
+            if self.reference_mode == ReferenceMode::None {
+                return;
+            }
+
             let loc_key = (callee_loc.line, callee_loc.column);
             if !self.def_locations.contains(&loc_key)
                 && !self.handled_ref_locations.contains(&loc_key)
             {
-                let ctx = self.line_context(callee_loc.line);
+                let ctx = self.reference_context(callee_loc.line);
                 self.references.push(Reference {
                     id: None,
                     name: callee_name,
@@ -731,6 +788,12 @@ impl<'a> ParseState<'a> {
             }
         }
     }
+
+    fn reference_context(&self, line: usize) -> Option<String> {
+        self.include_reference_context
+            .then(|| self.line_context(line))
+            .flatten()
+    }
 }
 
 // ── Helper functions ──
@@ -747,13 +810,23 @@ fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 }
 
 fn descendant_of_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    for i in 0..node.child_count() {
+    let mut stack = Vec::new();
+    for i in (0..node.child_count()).rev() {
         if let Some(child) = node.child(i as u32) {
-            if kinds.contains(&child.kind()) {
-                return Some(child);
-            }
-            if let Some(found) = descendant_of_kind(child, kinds) {
-                return Some(found);
+            stack.push((child, 1usize));
+        }
+    }
+
+    while let Some((current, depth)) = stack.pop() {
+        if kinds.contains(&current.kind()) {
+            return Some(current);
+        }
+        if depth >= MAX_PARSE_DEPTH {
+            continue;
+        }
+        for i in (0..current.child_count()).rev() {
+            if let Some(child) = current.child(i as u32) {
+                stack.push((child, depth + 1));
             }
         }
     }
@@ -778,7 +851,7 @@ fn classify_function(name: &str, parent: Option<&str>, is_method: bool) -> Symbo
 
 fn find_declarator_name_node<'a>(declarator: Node<'a>) -> Option<Node<'a>> {
     let mut current = declarator;
-    loop {
+    for _ in 0..MAX_PARSE_DEPTH {
         match current.kind() {
             "identifier" | "field_identifier" | "type_identifier" | "destructor_name" => {
                 return Some(current);
@@ -821,6 +894,7 @@ fn find_declarator_name_node<'a>(declarator: Node<'a>) -> Option<Node<'a>> {
             }
         }
     }
+    None
 }
 
 /// Walk declarator chain to find the name. Returns `(qualifier, name)` where
@@ -830,7 +904,7 @@ fn extract_name_from_declarator(
     source: &str,
 ) -> Option<(Option<String>, String)> {
     let mut current = declarator;
-    loop {
+    for _ in 0..MAX_PARSE_DEPTH {
         match current.kind() {
             "identifier" | "field_identifier" | "type_identifier" => {
                 let name = current
@@ -877,6 +951,7 @@ fn extract_name_from_declarator(
             }
         }
     }
+    None
 }
 
 fn extract_function_name(node: Node, source: &str) -> Option<(Option<String>, String)> {

@@ -7,6 +7,11 @@ use crate::types::*;
 
 /// Create the xref schema in the database.
 pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
+    create_tables(conn)?;
+    create_indexes(conn)
+}
+
+fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS files (
@@ -66,6 +71,14 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
             base_name TEXT
         );
 
+        ",
+    )?;
+    ensure_parent_name_column(conn)
+}
+
+fn create_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
         CREATE INDEX IF NOT EXISTS idx_definitions_name ON definitions(name);
         CREATE INDEX IF NOT EXISTS idx_definitions_qualified ON definitions(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_definitions_kind ON definitions(kind);
@@ -78,8 +91,25 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(derived_id);
         CREATE INDEX IF NOT EXISTS idx_inheritance_base ON inheritance(base_id);
         ",
-    )?;
-    ensure_parent_name_column(conn)
+    )
+}
+
+fn drop_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP INDEX IF EXISTS idx_definitions_name;
+        DROP INDEX IF EXISTS idx_definitions_qualified;
+        DROP INDEX IF EXISTS idx_definitions_kind;
+        DROP INDEX IF EXISTS idx_definitions_file;
+        DROP INDEX IF EXISTS idx_refs_name;
+        DROP INDEX IF EXISTS idx_refs_file;
+        DROP INDEX IF EXISTS idx_refs_def;
+        DROP INDEX IF EXISTS idx_call_graph_caller;
+        DROP INDEX IF EXISTS idx_call_graph_callee;
+        DROP INDEX IF EXISTS idx_inheritance_derived;
+        DROP INDEX IF EXISTS idx_inheritance_base;
+        ",
+    )
 }
 
 fn ensure_parent_name_column(conn: &Connection) -> rusqlite::Result<()> {
@@ -116,9 +146,17 @@ fn resolve_db_definition_id(
 pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=OFF;",
+        "
+        PRAGMA journal_mode=OFF;
+        PRAGMA synchronous=OFF;
+        PRAGMA foreign_keys=OFF;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA locking_mode=EXCLUSIVE;
+        PRAGMA cache_size=-200000;
+        ",
     )?;
-    create_schema(&conn)?;
+    create_tables(&conn)?;
+    drop_indexes(&conn)?;
 
     let tx = conn.unchecked_transaction()?;
 
@@ -130,14 +168,11 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
     // Insert files from the index's first-class file collection.
     let mut file_ids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     {
-        let mut insert_stmt =
-            tx.prepare("INSERT OR IGNORE INTO files (path, language) VALUES (?1, ?2)")?;
-        let mut select_stmt = tx.prepare("SELECT id FROM files WHERE path = ?1")?;
+        let mut insert_stmt = tx.prepare("INSERT INTO files (path, language) VALUES (?1, ?2)")?;
         for f in index.files() {
             let path_str = f.path.to_str().unwrap_or("");
             insert_stmt.execute(params![path_str, f.language.as_str()])?;
-            let id: i64 = select_stmt.query_row(params![path_str], |row| row.get(0))?;
-            file_ids.insert(path_str.to_string(), id);
+            file_ids.insert(path_str.to_string(), tx.last_insert_rowid());
         }
     }
 
@@ -257,8 +292,15 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
     }
 
     tx.commit()?;
-    // Re-enable foreign keys for future queries.
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    create_indexes(&conn)?;
+    // Re-enable safer defaults for future queries.
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys=ON;
+        PRAGMA locking_mode=NORMAL;
+        PRAGMA optimize;
+        ",
+    )?;
     Ok(conn)
 }
 
@@ -267,6 +309,7 @@ pub fn save_to_db(index: &Index, path: &Path) -> rusqlite::Result<Connection> {
 pub fn open_from_db(path: &Path) -> rusqlite::Result<(Index, Connection)> {
     let conn = Connection::open(path)?;
     create_schema(&conn)?;
+    create_indexes(&conn)?;
 
     // Preload all files; build both the lookup map and the IndexedFile collection.
     let file_map: std::collections::HashMap<i64, PathBuf> = {

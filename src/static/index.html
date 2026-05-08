@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xref-indexer</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #222; line-height: 1.5; }
+.app { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+/* header */
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
+header h1 { font-size: 20px; font-weight: 600; margin-right: auto; color: #333; }
+header h1 small { font-weight: 400; font-size: 13px; color: #888; margin-left: 8px; }
+.db-select { display: flex; gap: 6px; align-items: center; }
+.db-select label { font-size: 13px; color: #555; }
+.db-select input, .db-select select { padding: 6px 10px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
+.btn { padding: 6px 14px; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; background: #4a6cf7; color: #fff; }
+.btn:hover { background: #3b5de7; }
+.btn:disabled { opacity: 0.5; cursor: default; }
+
+/* cards */
+.card { background: #fff; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.1); padding: 16px; margin-bottom: 16px; }
+.card h2 { font-size: 14px; font-weight: 600; color: #555; margin-bottom: 8px; text-transform: uppercase; letter-spacing: .5px; }
+
+/* stats */
+.stats { display: flex; gap: 16px; flex-wrap: wrap; }
+.stat { flex: 1; min-width: 80px; text-align: center; padding: 12px; background: #fafafa; border-radius: 4px; }
+.stat .num { font-size: 28px; font-weight: 700; color: #4a6cf7; }
+.stat .lbl { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+
+/* tabs */
+.tabs { display: flex; gap: 2px; margin-bottom: 12px; flex-wrap: wrap; }
+.tab { padding: 6px 14px; font-size: 13px; background: #eee; border: none; border-radius: 4px 4px 0 0; cursor: pointer; color: #666; }
+.tab:hover { background: #e0e0e0; }
+.tab.active { background: #fff; color: #222; font-weight: 600; box-shadow: 0 -1px 3px rgba(0,0,0,.08); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* search */
+.search-row { display: flex; gap: 6px; margin-bottom: 12px; }
+.search-row input { flex: 1; padding: 8px 10px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
+
+/* tables */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #eee; white-space: nowrap; }
+th { font-weight: 600; color: #555; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; background: #fafafa; }
+td { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+tr:hover td { background: #f8f9ff; }
+
+/* raw sql textarea */
+.sql-box { width: 100%; min-height: 80px; font-family: "SF Mono", "Fira Code", monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 8px; }
+.sql-row { display: flex; gap: 6px; }
+.sql-row .sql-box { flex: 1; min-height: 40px; }
+.file-link { cursor: pointer; color: #4a6cf7; text-decoration: underline; }
+
+/* loading */
+.loading { color: #888; font-size: 13px; padding: 12px; text-align: center; }
+.error { color: #d32f2f; font-size: 13px; padding: 8px; background: #fdecea; border-radius: 4px; margin: 4px 0; }
+
+/* index form overlay */
+.overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 100; justify-content: center; align-items: center; }
+.overlay.open { display: flex; }
+.overlay .card { width: 440px; max-width: 90vw; }
+.overlay .form-row { margin-bottom: 10px; }
+.overlay .form-row label { display: block; font-size: 13px; font-weight: 600; color: #555; margin-bottom: 3px; }
+.overlay .form-row input, .overlay .form-row select { width: 100%; padding: 8px 10px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
+.overlay .form-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 12px; }
+.btn-secondary { background: #888; }
+.btn-secondary:hover { background: #666; }
+</style>
+</head>
+<body>
+<div class="app">
+
+<header>
+  <h1>🔍 xref-indexer <small>web UI</small></h1>
+  <div class="db-select">
+    <label for="db-select">Database:</label>
+    <select id="db-select" onchange="connectDb(this.value)">
+      <option value="">— select —</option>
+    </select>
+    <span style="color:#999;font-size:13px">or</span>
+    <input type="text" id="db-name" placeholder="new db name" onkeydown="if(event.key==='Enter')showIndexForm()">
+    <button class="btn" onclick="showIndexForm()">Index…</button>
+  </div>
+</header>
+
+<!-- Stats -->
+<div class="card" id="stats-card" style="display:none">
+  <h2>Database Stats</h2>
+  <div class="stats">
+    <div class="stat"><div class="num" id="stat-defs">0</div><div class="lbl">Definitions</div></div>
+    <div class="stat"><div class="num" id="stat-refs">0</div><div class="lbl">References</div></div>
+    <div class="stat"><div class="num" id="stat-calls">0</div><div class="lbl">Calls</div></div>
+    <div class="stat"><div class="num" id="stat-inherits">0</div><div class="lbl">Inherits</div></div>
+    <div class="stat"><div class="num" id="stat-files">0</div><div class="lbl">Files</div></div>
+  </div>
+</div>
+
+<!-- Query -->
+<div class="card" id="query-card" style="display:none">
+  <h2>Query</h2>
+  <div class="search-row">
+    <input type="text" id="query-input" placeholder="Symbol name (e.g. fmt::print, main, run)" onkeydown="if(event.key==='Enter')runQuery()">
+    <button class="btn" onclick="runQuery()">Search</button>
+  </div>
+
+  <div class="tabs" id="result-tabs">
+    <button class="tab active" data-tab="defs" onclick="switchTab('defs')">Definitions</button>
+    <button class="tab" data-tab="refs" onclick="switchTab('refs')">References</button>
+    <button class="tab" data-tab="callers" onclick="switchTab('callers')">Callers</button>
+    <button class="tab" data-tab="callees" onclick="switchTab('callees')">Callees</button>
+    <button class="tab" data-tab="hierarchy" onclick="switchTab('hierarchy')">Hierarchy</button>
+    <button class="tab" data-tab="search" onclick="switchTab('search')">Substring</button>
+    <button class="tab" data-tab="sql" onclick="switchTab('sql')">Raw SQL</button>
+  </div>
+
+  <div id="tab-defs" class="tab-content active"><div class="loading">Enter a symbol name above</div></div>
+  <div id="tab-refs" class="tab-content"><div class="loading">Enter a symbol name above</div></div>
+  <div id="tab-callers" class="tab-content"><div class="loading">Enter a symbol name above</div></div>
+  <div id="tab-callees" class="tab-content"><div class="loading">Enter a symbol name above</div></div>
+  <div id="tab-hierarchy" class="tab-content"><div class="loading">Enter a class name above</div></div>
+  <div id="tab-search" class="tab-content">
+    <div class="search-row" style="margin-top:4px">
+      <input type="text" id="substring-input" placeholder="Substring pattern (e.g. compute)" onkeydown="if(event.key==='Enter')runSubstring()">
+      <button class="btn" onclick="runSubstring()">Search</button>
+    </div>
+    <div id="substring-results"><div class="loading">Enter a substring pattern</div></div>
+  </div>
+  <div id="tab-sql" class="tab-content">
+    <div class="sql-row">
+      <textarea class="sql-box" id="sql-input" placeholder="SELECT name, qualified_name, kind FROM definitions LIMIT 10">SELECT name, qualified_name, kind FROM definitions LIMIT 10</textarea>
+      <button class="btn" onclick="runSql()" style="align-self:flex-start">Run</button>
+    </div>
+    <div id="sql-results"><div class="loading">Enter SQL above</div></div>
+  </div>
+</div>
+
+</div><!-- .app -->
+
+<!-- Index dialog -->
+<div class="overlay" id="index-overlay">
+  <div class="card">
+    <h2 style="margin-bottom:12px">Index a Codebase</h2>
+    <div class="form-row">
+      <label for="idx-path">Path to codebase</label>
+      <input type="text" id="idx-path" placeholder="/home/user/project">
+    </div>
+    <div class="form-row">
+      <label for="idx-lang">Language</label>
+      <select id="idx-lang"><option value="cpp">C++</option><option value="c">C</option></select>
+    </div>
+    <div class="form-row">
+      <label for="idx-db">Database name</label>
+      <input type="text" id="idx-db" placeholder="my_project">
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" onclick="closeIndexForm()">Cancel</button>
+      <button class="btn" id="idx-submit" onclick="startIndex()">Start Indexing</button>
+    </div>
+    <div id="idx-progress" style="margin-top:8px;font-size:13px;color:#666;display:none">Indexing…</div>
+  </div>
+</div>
+
+<script>
+let currentDb = "";
+
+// ── DB management ──
+
+async function loadDbList() {
+  const resp = await fetch("/api/v1/dbs");
+  const data = await resp.json();
+  const sel = document.getElementById("db-select");
+  const current = sel.value;
+  sel.innerHTML = '<option value="">— select —</option>';
+  if (data.success && data.data) {
+    data.data.forEach(db => {
+      const opt = document.createElement("option");
+      opt.value = db.name;
+      opt.textContent = db.name;
+      sel.appendChild(opt);
+    });
+  }
+  if (current && [...sel.options].some(o => o.value === current)) sel.value = current;
+}
+loadDbList();
+
+function connectDb(name) {
+  currentDb = name;
+  if (!name) {
+    document.getElementById("stats-card").style.display = "none";
+    document.getElementById("query-card").style.display = "none";
+    return;
+  }
+  document.getElementById("query-card").style.display = "block";
+  loadStats();
+}
+
+async function loadStats() {
+  if (!currentDb) return;
+  document.getElementById("stats-card").style.display = "block";
+  const resp = await fetch(`/api/v1/db/${currentDb}/stats`);
+  const data = await resp.json();
+  if (!data.success) return;
+  const s = data.data;
+  document.getElementById("stat-defs").textContent = s.definitions ?? 0;
+  document.getElementById("stat-refs").textContent = s.references ?? 0;
+  document.getElementById("stat-calls").textContent = s.calls ?? 0;
+  document.getElementById("stat-inherits").textContent = s.inherits ?? 0;
+  document.getElementById("stat-files").textContent = (s.files && s.files.length) || 0;
+}
+
+// ── Index dialog ──
+
+function showIndexForm() {
+  const name = document.getElementById("db-name").value.trim();
+  if (name) document.getElementById("idx-db").value = name;
+  document.getElementById("index-overlay").classList.add("open");
+}
+
+function closeIndexForm() {
+  document.getElementById("index-overlay").classList.remove("open");
+  document.getElementById("idx-progress").style.display = "none";
+  document.getElementById("idx-submit").disabled = false;
+}
+
+async function startIndex() {
+  const path = document.getElementById("idx-path").value.trim();
+  const lang = document.getElementById("idx-lang").value;
+  const db = document.getElementById("idx-db").value.trim();
+  if (!path || !db) { alert("Path and database name are required"); return; }
+
+  document.getElementById("idx-submit").disabled = true;
+  document.getElementById("idx-progress").style.display = "block";
+  document.getElementById("idx-progress").textContent = "Indexing…";
+
+  const resp = await fetch("/api/v1/index", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, language: lang, db }),
+  });
+  const data = await resp.json();
+  document.getElementById("idx-progress").textContent = "";
+  document.getElementById("idx-progress").style.display = "none";
+  document.getElementById("idx-submit").disabled = false;
+
+  if (data.success) {
+    closeIndexForm();
+    await loadDbList();
+    document.getElementById("db-select").value = db;
+    connectDb(db);
+  } else {
+    document.getElementById("idx-progress").style.display = "block";
+    document.getElementById("idx-progress").textContent = "Error: " + (data.error || "unknown");
+  }
+}
+
+// ── Tabs ──
+
+function switchTab(name) {
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".tab-content").forEach(t => t.classList.remove("active"));
+  document.querySelector(`.tab[data-tab="${name}"]`).classList.add("active");
+  document.getElementById(`tab-${name}`).classList.add("active");
+}
+
+// ── Query ──
+
+async function runQuery() {
+  const name = document.getElementById("query-input").value.trim();
+  if (!name || !currentDb) return;
+  loadDefs(name);
+  loadRefs(name);
+  loadCallers(name);
+  loadCallees(name);
+  loadHierarchy(name);
+}
+
+async function loadDefs(name) {
+  const el = document.getElementById("tab-defs");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/definitions?name=${encodeURIComponent(name)}`);
+  const data = await resp.json();
+  el.innerHTML = data.success ? renderDefTable(data.data) : renderError(data.error);
+}
+
+async function loadRefs(name) {
+  const el = document.getElementById("tab-refs");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/references?name=${encodeURIComponent(name)}`);
+  const data = await resp.json();
+  el.innerHTML = data.success ? renderRefTable(data.data) : renderError(data.error);
+}
+
+async function loadCallers(name) {
+  const el = document.getElementById("tab-callers");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/callers?name=${encodeURIComponent(name)}`);
+  const data = await resp.json();
+  el.innerHTML = data.success ? renderDefTable(data.data) : renderError(data.error);
+}
+
+async function loadCallees(name) {
+  const el = document.getElementById("tab-callees");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/callees?name=${encodeURIComponent(name)}`);
+  const data = await resp.json();
+  el.innerHTML = data.success ? renderDefTable(data.data) : renderError(data.error);
+}
+
+async function loadHierarchy(name) {
+  const el = document.getElementById("tab-hierarchy");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/hierarchy?class=${encodeURIComponent(name)}`);
+  const data = await resp.json();
+  if (!data.success) { el.innerHTML = renderError(data.error); return; }
+  let html = "";
+  if (data.data.bases && data.data.bases.length) {
+    html += "<h3 style='font-size:13px;margin:6px 0'>Bases (parent classes)</h3>" + renderDefTable(data.data.bases);
+  }
+  if (data.data.derived && data.data.derived.length) {
+    html += "<h3 style='font-size:13px;margin:6px 0'>Derived (subclasses)</h3>" + renderDefTable(data.data.derived);
+  }
+  if (!html) html = "<div class='loading'>No hierarchy found</div>";
+  el.innerHTML = html;
+}
+
+// ── Substring search ──
+
+async function runSubstring() {
+  const q = document.getElementById("substring-input").value.trim();
+  if (!q || !currentDb) return;
+  const el = document.getElementById("substring-results");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/search?q=${encodeURIComponent(q)}`);
+  const data = await resp.json();
+  el.innerHTML = data.success ? renderDefTable(data.data) : renderError(data.error);
+}
+
+// ── Raw SQL ──
+
+async function runSql() {
+  const sql = document.getElementById("sql-input").value.trim();
+  if (!sql || !currentDb) return;
+  const el = document.getElementById("sql-results");
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const resp = await fetch(`/api/v1/db/${currentDb}/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sql }),
+  });
+  const data = await resp.json();
+  el.innerHTML = data.success ? renderSqlTable(data.data) : renderError(data.error);
+}
+
+// ── Render helpers ──
+
+function renderDefTable(defs) {
+  if (!defs || !defs.length) return "<div class='loading'>No results</div>";
+  let rows = defs.map(d => `<tr>
+    <td>${esc(d.kind)}</td>
+    <td>${esc(d.name)}</td>
+    <td title="${esc(d.qualified_name)}">${esc(d.qualified_name)}</td>
+    <td>${esc(d.file)}:${d.location.line}:${d.location.column}</td>
+    <td>${esc(d.signature || "")}</td>
+    <td>${d.is_definition ? "✓" : ""}</td>
+  </tr>`).join("");
+  return `<table><thead><tr><th>Kind</th><th>Name</th><th>Qualified</th><th>Location</th><th>Signature</th><th>Def</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderRefTable(refs) {
+  if (!refs || !refs.length) return "<div class='loading'>No results</div>";
+  let rows = refs.map(r => `<tr>
+    <td>${esc(r.name)}</td>
+    <td>${esc(r.file)}:${r.location.line}:${r.location.column}</td>
+    <td>${esc(r.context || "")}</td>
+  </tr>`).join("");
+  return `<table><thead><tr><th>Name</th><th>Location</th><th>Context</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderSqlTable(res) {
+  if (!res || !res.columns || !res.rows) return "<div class='loading'>No results</div>";
+  if (res.rows.length === 0) return "<div class='loading'>0 rows returned</div>";
+  const cols = res.columns;
+  const header = cols.map(c => `<th>${esc(c)}</th>`).join("");
+  const rows = res.rows.map(r => {
+    const cells = cols.map(c => `<td title="${esc(String(r[c] ?? ""))}">${esc(String(r[c] ?? ""))}</td>`).join("");
+    return `<tr>${cells}</tr>`;
+  }).join("");
+  return `<table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderError(msg) {
+  return `<div class="error">${esc(msg)}</div>`;
+}
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

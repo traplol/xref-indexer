@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use serde::Serialize;
 
 use crate::types::*;
 
@@ -223,6 +224,7 @@ impl Index {
     }
 }
 
+#[derive(Debug, Serialize)]
 pub struct ClassHierarchy<'a> {
     pub bases: Vec<&'a Definition>,
     pub derived: Vec<&'a Definition>,
@@ -245,6 +247,22 @@ impl IndexBuilder {
             references: Vec::new(),
             calls: Vec::new(),
             inherits: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(
+        files: usize,
+        definitions: usize,
+        references: usize,
+        calls: usize,
+        inherits: usize,
+    ) -> Self {
+        Self {
+            files: Vec::with_capacity(files),
+            definitions: Vec::with_capacity(definitions),
+            references: Vec::with_capacity(references),
+            calls: Vec::with_capacity(calls),
+            inherits: Vec::with_capacity(inherits),
         }
     }
 
@@ -272,27 +290,25 @@ impl IndexBuilder {
     }
 
     fn resolve_references(&mut self) {
-        // Build a quick lookup: name → set of qualified names.
-        let mut name_to_qualified: FxHashMap<String, Vec<String>> = FxHashMap::default();
-        let mut qualified_set: FxHashMap<String, usize> = FxHashMap::default();
+        // Build borrowed lookups so large runs do not clone hundreds of
+        // thousands of definition names just to resolve reference IDs.
+        let mut qualified_to_id: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut unique_name_to_id: FxHashMap<&str, Option<usize>> = FxHashMap::default();
         for (i, def) in self.definitions.iter().enumerate() {
-            name_to_qualified
-                .entry(def.name.clone())
-                .or_default()
-                .push(def.qualified_name.clone());
-            qualified_set.insert(def.qualified_name.clone(), i);
+            qualified_to_id.insert(def.qualified_name.as_str(), i);
+            unique_name_to_id
+                .entry(def.name.as_str())
+                .and_modify(|existing| *existing = None)
+                .or_insert(Some(i));
         }
 
         for r in &mut self.references {
-            if let Some(qnames) = name_to_qualified.get(&r.name) {
-                if qnames.len() == 1 {
-                    // Unambiguous: use the only match.
-                    if let Some(&def_idx) = qualified_set.get(&qnames[0]) {
-                        r.def_id = Some(DefId(def_idx));
-                    }
-                }
-                // If ambiguous (multiple definitions with same name), we leave def_id as None.
+            if let Some(&def_idx) = qualified_to_id.get(r.name.as_str()) {
+                r.def_id = Some(DefId(def_idx));
+            } else if let Some(Some(def_idx)) = unique_name_to_id.get(r.name.as_str()) {
+                // If ambiguous (multiple definitions with same name), leave def_id as None.
                 // Future: use file/scope proximity to disambiguate.
+                r.def_id = Some(DefId(*def_idx));
             }
         }
     }
